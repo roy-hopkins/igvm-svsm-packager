@@ -350,7 +350,12 @@ fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
     let mut buf = vec![0; 4096];
     let mut directive: Vec<IgvmDirectiveHeader> = vec![];
     let mut in_file = File::open(in_filename).expect("Could not open input file");
-    let mut gpa = 0;
+    // When bundled with OVMF, the SVSM is located directly below
+    // the bottom of the firmware. Now we have detached the SVSM from
+    // OVMF it can be located at a different address. This is close
+    // to the original, calculated address.
+    let svsm_gpa = 0xff400000;
+    let mut gpa = svsm_gpa;
 
     // Populate the SVSM binary as normal pages
     while let Ok(len) = in_file.read(&mut buf) {
@@ -362,36 +367,12 @@ fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
         buf = vec![0; 4096];
     }
 
-    // Remap gpa of pages based on page count
-    //gpa = 0xffc00000 - 0x1000u64 * directive.len() as u64;
-    gpa = 0xff400000;
-    println!("GPA={:x}", gpa);
-    directive = directive
-        .iter()
-        .map(|page| match page {
-            IgvmDirectiveHeader::PageData {
-                gpa: gpa_offset,
-                compatibility_mask,
-                flags,
-                data_type,
-                data,
-            } => IgvmDirectiveHeader::PageData {
-                gpa: gpa + gpa_offset,
-                compatibility_mask: *compatibility_mask,
-                flags: *flags,
-                data_type: *data_type,
-                data: data.clone(),
-            },
-            other => other.clone(),
-        })
-        .collect();
-
     // Add the metadata using the special page types
     add_metadata_pages(&mut directive);
 
     // Initial CPU state
     for vp_index in 0..8 {
-        directive.push(new_vp_context(0, 1, gpa, vp_index));
+        directive.push(new_vp_context(0, 1, svsm_gpa, vp_index));
     }
 
     let file = IgvmFile::new(
