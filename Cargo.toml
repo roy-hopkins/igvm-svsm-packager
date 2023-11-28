@@ -8,3 +8,5 @@ edition = "2021"
 [dependencies]
 igvm_defs = { path = '../ms_igvm/igvm_defs' }
 igvm = { path = '../ms_igvm/igvm' }
+zerocopy = "0.6"
+bitflags = "2.4"

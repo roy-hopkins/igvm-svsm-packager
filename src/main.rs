@@ -4,20 +4,38 @@
 //
 // Author: Roy Hopkins <rhopkins@suse.de>
 
+use gdt::new_gdt;
+use igvm::{IgvmDirectiveHeader, IgvmFile, IgvmPlatformHeader, IgvmRevision};
+use igvm_defs::{
+    IgvmPageDataFlags, IgvmPageDataType, IgvmPlatformType, IGVM_VHS_SUPPORTED_PLATFORM,
+    PAGE_SIZE_4K,
+};
+use pagetable::new_pagetable;
 use std::{
     env,
     fs::File,
     io::{Read, Write},
 };
+use vpcontext::new_vp_context;
+use zerocopy::AsBytes;
 
-use igvm::{
-    snp_defs::{SevFeatures, SevSelector, SevVirtualInterruptControl, SevVmsa, SevXmmRegister},
-    IgvmDirectiveHeader, IgvmFile, IgvmPlatformHeader, IgvmRevision,
-};
-use igvm_defs::{
-    IgvmPageDataFlags, IgvmPageDataType, IgvmPlatformType, IGVM_VHS_SUPPORTED_PLATFORM,
-    PAGE_SIZE_4K,
-};
+mod gdt;
+mod pagetable;
+mod vpcontext;
+
+const SVSM_GDT: u64 = 0xff2ff000;
+const SVSM_PAGETABLE: u64 = 0xff300000;
+const SVSM_METADATA: u64 = 0xff3ff000;
+const SVSM_BASE: u64 = 0xff400000;
+const SVSM_HEAP_BASE: u64 = 512 * (1u64 << 30);
+const SVSM_HEAP_SIZE: u64 = 256 * (1u64 << 20);
+
+#[repr(C)]
+#[derive(AsBytes)]
+struct SvsmHeap {
+    pub base: u64,
+    pub size: u64,
+}
 
 #[repr(C, packed(1))]
 #[derive(Default)]
@@ -144,7 +162,7 @@ fn new_page_data(gpa: u64, compatibility_mask: u32, data: Vec<u8>) -> IgvmDirect
 }
 
 fn add_metadata_pages(pages: &mut Vec<IgvmDirectiveHeader>) {
-    let mut flags = IgvmPageDataFlags::new();
+    let flags = IgvmPageDataFlags::new();
     // SEV_DESC_TYPE_SNP_SEC_MEM
     for index in 0..((632 * 1024) / PAGE_SIZE_4K) {
         pages.push(IgvmDirectiveHeader::PageData {
@@ -173,176 +191,40 @@ fn add_metadata_pages(pages: &mut Vec<IgvmDirectiveHeader>) {
         data_type: IgvmPageDataType::CPUID_DATA,
         data: vec![],
     });
+
+    // Information we want to exchange with SVSM
+    let heap = SvsmHeap {
+        base: SVSM_HEAP_BASE,
+        size: SVSM_HEAP_SIZE,
+    };
+    pages.push(IgvmDirectiveHeader::PageData {
+        gpa: SVSM_METADATA,
+        compatibility_mask: 1,
+        flags,
+        data_type: IgvmPageDataType::NORMAL,
+        data: heap.as_bytes().to_vec(),
+    });
 }
 
-fn new_vp_context(
-    gpa: u64,
-    compatibility_mask: u32,
-    rip: u64,
-    vp_index: u16,
-) -> IgvmDirectiveHeader {
-    let mut vmsa = Box::new(SevVmsa {
-        es: SevSelector {
-            selector: 16,
-            attrib: 0xc093,
-            limit: 0xffffffff,
-            base: 0,
-        },
-        cs: SevSelector {
-            selector: 8,
-            attrib: 0xc09b,
-            limit: 0xffffffff,
-            base: 0,
-        },
-        ss: SevSelector {
-            selector: 16,
-            attrib: 0xc093,
-            limit: 0xffffffff,
-            base: 0,
-        },
-        ds: SevSelector {
-            selector: 16,
-            attrib: 0xc093,
-            limit: 0xffffffff,
-            base: 0,
-        },
-        fs: SevSelector {
-            selector: 16,
-            attrib: 0xc093,
-            limit: 0xffffffff,
-            base: 0,
-        },
-        gs: SevSelector {
-            selector: 0,
-            attrib: 0,
-            limit: 0,
-            base: 0,
-        },
-        gdtr: SevSelector {
-            selector: 0,
-            attrib: 0,
-            limit: 0,
-            base: 0,
-        },
-        ldtr: SevSelector {
-            selector: 0,
-            attrib: 0,
-            limit: 0,
-            base: 0,
-        },
-        idtr: SevSelector {
-            selector: 0,
-            attrib: 0,
-            limit: 0,
-            base: 0,
-        },
-        tr: SevSelector {
-            selector: 0,
-            attrib: 0,
-            limit: 0,
-            base: 0,
-        },
-        pl0_ssp: 0,
-        pl1_ssp: 0,
-        pl2_ssp: 0,
-        pl3_ssp: 0,
-        u_cet: 0,
-        vmsa_reserved1: [0; 2],
-        vmpl: 0,
-        cpl: 0,
-        vmsa_reserved2: 0,
-        efer: 0,
-        vmsa_reserved3: [0; 26],
-        xss: 0,
-        cr4: 0,
-        cr3: 0,
-        cr0: 0x60000011,
-        dr7: 0,
-        dr6: 0,
-        rflags: 0,
-        rip,
-        dr0: 0,
-        dr1: 0,
-        dr2: 0,
-        dr3: 0,
-        dr0_addr_mask: 0,
-        dr1_addr_mask: 0,
-        dr2_addr_mask: 0,
-        dr3_addr_mask: 0,
-        vmsa_reserved4: [0; 3],
-        rsp: 0,
-        s_cet: 0,
-        ssp: 0,
-        interrupt_ssp_table_addr: 0,
-        rax: 0,
-        star: 0,
-        lstar: 0,
-        cstar: 0,
-        sfmask: 0,
-        kernel_gs_base: 0,
-        sysenter_cs: 0,
-        sysenter_esp: 0,
-        sysenter_epi: 0,
-        cr2: 0,
-        vmsa_reserved5: [0; 4],
-        pat: 0,
-        dbgctl: 0,
-        last_branch_from_ip: 0,
-        last_branch_to_ip: 0,
-        last_excp_from_ip: 0,
-        last_excp_to_ip: 0,
-        vmsa_reserved6: [0; 9],
-        spec_ctrl: 0,
-        vmsa_reserved7: [0; 8],
-        rcx: 0,
-        rdx: 0,
-        rbx: 0,
-        vmsa_reserved8: 0,
-        rbp: 0,
-        rsi: 0,
-        rdi: 0,
-        r8: 0,
-        r9: 0,
-        r10: 0,
-        r11: 0,
-        r12: 0,
-        r13: 0,
-        r14: 0,
-        r15: 0,
-        vmsa_reserved9: [0; 2],
-        exit_info1: 0,
-        exit_info2: 0,
-        exit_int_info: 0,
-        next_rip: 0,
-        sev_features: SevFeatures::new(),
-        v_intr_cntrl: SevVirtualInterruptControl(0),
-        guest_error_code: 0,
-        virtual_tom: 0,
-        tlb_id: 0,
-        pcpu_id: 0,
-        event_inject: igvm::snp_defs::SevEventInjectInfo(0),
-        xcr0: 0,
-        xsave_valid_bitmap: [0; 16],
-        x87dp: 0,
-        mxcsr: 0,
-        x87_ftw: 0,
-        x87_fsw: 0,
-        x87_fcw: 0,
-        x87_op: 0,
-        x87_ds: 0,
-        x87_cs: 0,
-        x87_rip: 0,
-        x87_registers1: [0; 32],
-        x87_registers2: [0; 32],
-        x87_registers3: [0; 16],
-        xmm_registers: [SevXmmRegister { low: 0, high: 0 }; 16],
-        ymm_registers: [SevXmmRegister { low: 0, high: 0 }; 16],
-    });
-    IgvmDirectiveHeader::SnpVpContext {
-        gpa: 0,
-        compatibility_mask,
-        vp_index,
-        vmsa,
+fn add_svsm_ram(compatibility_mask: u32, pages: &mut Vec<IgvmDirectiveHeader>) {
+    // 512G
+    let heap_base = 512 * (1u64 << 30);
+    // 256MB
+    let heap_size = 256 * (1u64 << 20);
+    let mut gpa = heap_base;
+    let mut flags = IgvmPageDataFlags::new();
+    flags.set_is_2mb_page(true);
+    flags.set_unmeasured(true);
+
+    while gpa < (heap_base + heap_size) {
+        pages.push(IgvmDirectiveHeader::PageData {
+            gpa,
+            compatibility_mask,
+            flags,
+            data_type: IgvmPageDataType::NORMAL,
+            data: vec![],
+        });
+        gpa += 0x200000;
     }
 }
 
@@ -354,8 +236,7 @@ fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
     // the bottom of the firmware. Now we have detached the SVSM from
     // OVMF it can be located at a different address. This is close
     // to the original, calculated address.
-    let svsm_gpa = 0xff400000;
-    let mut gpa = svsm_gpa;
+    let mut gpa = SVSM_BASE;
 
     // Populate the SVSM binary as normal pages
     while let Ok(len) = in_file.read(&mut buf) {
@@ -370,9 +251,26 @@ fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
     // Add the metadata using the special page types
     add_metadata_pages(&mut directive);
 
+    // Add the SVSM heap memory
+    add_svsm_ram(1, &mut directive);
+
+    // Add the GDT
+    let gdt_limit = new_gdt(SVSM_GDT, &mut directive);
+
+    // Add the initial identity mapped page table
+    new_pagetable(SVSM_PAGETABLE, &mut directive);
+
     // Initial CPU state
     for vp_index in 0..8 {
-        directive.push(new_vp_context(0, 1, svsm_gpa, vp_index));
+        directive.push(new_vp_context(
+            0,
+            1,
+            SVSM_BASE,
+            SVSM_PAGETABLE,
+            SVSM_GDT,
+            gdt_limit,
+            vp_index,
+        ));
     }
 
     let file = IgvmFile::new(
@@ -392,6 +290,11 @@ fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    let args = vec![
+        "notused".to_string(),
+        "/home/rhopkins/src/coco-svsm-branches/rdh-svsm/svsm.bin".to_string(),
+        "svsm.igvm".to_string(),
+    ];
     if args.len() != 3 {
         println!("Usage igvm_svsm /path/to/svsm.bin /path/to/out.igvm");
         return;
