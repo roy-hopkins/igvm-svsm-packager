@@ -16,7 +16,7 @@ use std::{
     fs::File,
     io::{Read, Write},
 };
-use vpcontext::new_vp_context;
+use vpcontext::new_vp_context_32;
 use zerocopy::AsBytes;
 
 mod gdt;
@@ -262,7 +262,7 @@ fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
 
     // Initial CPU state
     for vp_index in 0..8 {
-        directive.push(new_vp_context(
+        directive.push(new_vp_context_32(
             0,
             1,
             SVSM_BASE,
@@ -290,11 +290,13 @@ fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    /*
     let args = vec![
         "notused".to_string(),
         "/home/rhopkins/src/coco-svsm-branches/rdh-svsm/svsm.bin".to_string(),
         "svsm.igvm".to_string(),
     ];
+    */
     if args.len() != 3 {
         println!("Usage igvm_svsm /path/to/svsm.bin /path/to/out.igvm");
         return;
