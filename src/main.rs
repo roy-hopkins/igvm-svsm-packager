@@ -4,13 +4,12 @@
 //
 // Author: Roy Hopkins <rhopkins@suse.de>
 
-use gdt::new_gdt;
 use igvm::{IgvmDirectiveHeader, IgvmFile, IgvmPlatformHeader, IgvmRevision};
 use igvm_defs::{
     IgvmPageDataFlags, IgvmPageDataType, IgvmPlatformType, IGVM_VHS_SUPPORTED_PLATFORM,
     PAGE_SIZE_4K,
 };
-use pagetable::new_pagetable;
+use igvm_param_defs::IgvmParamBlock;
 use std::{
     env,
     fs::File,
@@ -20,15 +19,18 @@ use vpcontext::new_vp_context_32;
 use zerocopy::AsBytes;
 
 mod gdt;
+mod igvm_param_defs;
 mod pagetable;
 mod vpcontext;
 
-const SVSM_GDT: u64 = 0xff2ff000;
-const SVSM_PAGETABLE: u64 = 0xff300000;
-const SVSM_METADATA: u64 = 0xff3ff000;
-const SVSM_BASE: u64 = 0xff400000;
-const SVSM_HEAP_BASE: u64 = 512 * (1u64 << 30);
-const SVSM_HEAP_SIZE: u64 = 256 * (1u64 << 20);
+const SVSM_BASE: u64 = 0x10000;
+const KERNEL_BASE: u64 = 0xff000000;
+const IGVM_PARAMS: u64 = SVSM_BASE - 0x1000;
+const SVSM_STACK: u64 = IGVM_PARAMS;
+const CPUID_PAGE: u32 = 636 * 1024;
+const SECRETS_PAGE: u32 = 632 * 1024;
+const KERNEL_REGION_BASE: u64 = 512 * (1u64 << 30);
+const KERNEL_REGION_SIZE: u64 = 256 * (1u64 << 20);
 
 #[repr(C)]
 #[derive(AsBytes)]
@@ -161,10 +163,31 @@ fn new_page_data(gpa: u64, compatibility_mask: u32, data: Vec<u8>) -> IgvmDirect
     }
 }
 
-fn add_metadata_pages(pages: &mut Vec<IgvmDirectiveHeader>) {
+fn add_metadata_pages(params: &IgvmParamBlock, pages: &mut Vec<IgvmDirectiveHeader>) {
     let flags = IgvmPageDataFlags::new();
+
+    // IGVM Parameters
+    pages.push(IgvmDirectiveHeader::PageData {
+        gpa: IGVM_PARAMS,
+        compatibility_mask: 1,
+        flags,
+        data_type: IgvmPageDataType::NORMAL,
+        data: params.as_bytes().to_vec(),
+    });
+
     // SEV_DESC_TYPE_SNP_SEC_MEM
-    for index in 0..((632 * 1024) / PAGE_SIZE_4K) {
+    for index in 0..((SVSM_STACK - 0x1000) / PAGE_SIZE_4K) {
+        pages.push(IgvmDirectiveHeader::PageData {
+            gpa: index * PAGE_SIZE_4K,
+            compatibility_mask: 1,
+            flags,
+            data_type: IgvmPageDataType::NORMAL,
+            data: vec![],
+        });
+    }
+    for index in ((params.stage2_base + params.stage2_size as u64) / PAGE_SIZE_4K)
+        ..(SECRETS_PAGE as u64 / PAGE_SIZE_4K)
+    {
         pages.push(IgvmDirectiveHeader::PageData {
             gpa: index * PAGE_SIZE_4K,
             compatibility_mask: 1,
@@ -176,7 +199,7 @@ fn add_metadata_pages(pages: &mut Vec<IgvmDirectiveHeader>) {
 
     // SEV_DESC_TYPE_SNP_SECRETS
     pages.push(IgvmDirectiveHeader::PageData {
-        gpa: 632 * 1024,
+        gpa: SECRETS_PAGE as u64,
         compatibility_mask: 1,
         flags,
         data_type: IgvmPageDataType::SECRETS,
@@ -185,38 +208,39 @@ fn add_metadata_pages(pages: &mut Vec<IgvmDirectiveHeader>) {
 
     // SEV_DESC_TYPE_CPUID
     pages.push(IgvmDirectiveHeader::PageData {
-        gpa: 636 * 1024,
+        gpa: CPUID_PAGE as u64,
         compatibility_mask: 1,
         flags,
         data_type: IgvmPageDataType::CPUID_DATA,
         data: vec![],
     });
-
-    // Information we want to exchange with SVSM
-    let heap = SvsmHeap {
-        base: SVSM_HEAP_BASE,
-        size: SVSM_HEAP_SIZE,
-    };
-    pages.push(IgvmDirectiveHeader::PageData {
-        gpa: SVSM_METADATA,
-        compatibility_mask: 1,
-        flags,
-        data_type: IgvmPageDataType::NORMAL,
-        data: heap.as_bytes().to_vec(),
-    });
 }
 
-fn add_svsm_ram(compatibility_mask: u32, pages: &mut Vec<IgvmDirectiveHeader>) {
-    // 512G
-    let heap_base = 512 * (1u64 << 30);
-    // 256MB
-    let heap_size = 256 * (1u64 << 20);
-    let mut gpa = heap_base;
+fn add_stack_page(
+    params: &IgvmParamBlock,
+    directive: &mut Vec<IgvmDirectiveHeader>,
+    kernel_pages: u32,
+) {
+    let mut stack = vec![0; 4096];
+    unsafe {
+        let p = stack.as_mut_ptr() as *mut u32;
+        p.offset(1022).write(IGVM_PARAMS as u32);
+        p.offset(1021).write(params.fs_base as u32 + params.fs_size);
+        p.offset(1020).write(params.fs_base as u32);
+        p.offset(1019)
+            .write(KERNEL_BASE as u32 + kernel_pages * 0x1000);
+        p.offset(1018).write(KERNEL_BASE as u32);
+    }
+    directive.push(new_page_data(SVSM_STACK - 0x1000, 1, stack));
+}
+
+fn add_svsm_kernel_region(compatibility_mask: u32, pages: &mut Vec<IgvmDirectiveHeader>) {
+    let mut gpa = KERNEL_REGION_BASE;
     let mut flags = IgvmPageDataFlags::new();
     flags.set_is_2mb_page(true);
     flags.set_unmeasured(true);
 
-    while gpa < (heap_base + heap_size) {
+    while gpa < (KERNEL_REGION_BASE + KERNEL_REGION_SIZE) {
         pages.push(IgvmDirectiveHeader::PageData {
             gpa,
             compatibility_mask,
@@ -228,17 +252,16 @@ fn add_svsm_ram(compatibility_mask: u32, pages: &mut Vec<IgvmDirectiveHeader>) {
     }
 }
 
-fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
+fn add_pages_from_file(
+    path: &String,
+    gpa_base: u64,
+    directive: &mut Vec<IgvmDirectiveHeader>,
+) -> u32 {
+    let mut gpa = gpa_base;
+    let mut in_file = File::open(path).expect("Could not open input file");
     let mut buf = vec![0; 4096];
-    let mut directive: Vec<IgvmDirectiveHeader> = vec![];
-    let mut in_file = File::open(in_filename).expect("Could not open input file");
-    // When bundled with OVMF, the SVSM is located directly below
-    // the bottom of the firmware. Now we have detached the SVSM from
-    // OVMF it can be located at a different address. This is close
-    // to the original, calculated address.
-    let mut gpa = SVSM_BASE;
+    let mut page_count = 0;
 
-    // Populate the SVSM binary as normal pages
     while let Ok(len) = in_file.read(&mut buf) {
         if len == 0 {
             break;
@@ -246,19 +269,47 @@ fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
         directive.push(new_page_data(gpa, 1, buf));
         gpa += PAGE_SIZE_4K;
         buf = vec![0; 4096];
+        page_count += 1;
     }
+    page_count
+}
+
+fn create_svsm_igvm(in_path: &str, out_filename: &str) {
+    let stage2_path = in_path.to_string() + "/stage2.bin";
+    let kernel_path = in_path.to_string() + "/kernel.elf";
+    let ramfs_path = in_path.to_string() + "/svsm-fs.bin";
+    let mut directive: Vec<IgvmDirectiveHeader> = vec![];
+
+    // Populate stage2, the kernel elf and the file system consecutively from
+    // the base address.
+    let stage2_pages = add_pages_from_file(&stage2_path, SVSM_BASE, &mut directive);
+    let kernel_pages = add_pages_from_file(&kernel_path, KERNEL_BASE, &mut directive);
+    let ramfs_base = KERNEL_BASE + kernel_pages as u64 * 0x1000;
+    let ramfs_pages = add_pages_from_file(&ramfs_path, ramfs_base, &mut directive);
+
+    let params = IgvmParamBlock {
+        param_page: 0,
+        cpuid_page: CPUID_PAGE,
+        secrets_page: SECRETS_PAGE,
+        memory_map: 0,
+        launch_fw: 1,
+        _reserved: [0; 3],
+        kernel_size: KERNEL_REGION_SIZE as u32,
+        kernel_base: KERNEL_REGION_BASE,
+        stage2_size: stage2_pages * 0x1000,
+        stage2_base: SVSM_BASE,
+        fs_size: ramfs_pages * 0x1000,
+        fs_base: ramfs_base,
+    };
 
     // Add the metadata using the special page types
-    add_metadata_pages(&mut directive);
+    add_metadata_pages(&params, &mut directive);
+
+    // Create the initial stage 2 stack
+    add_stack_page(&params, &mut directive, kernel_pages);
 
     // Add the SVSM heap memory
-    add_svsm_ram(1, &mut directive);
-
-    // Add the GDT
-    let gdt_limit = new_gdt(SVSM_GDT, &mut directive);
-
-    // Add the initial identity mapped page table
-    new_pagetable(SVSM_PAGETABLE, &mut directive);
+    add_svsm_kernel_region(1, &mut directive);
 
     // Initial CPU state
     for vp_index in 0..8 {
@@ -266,9 +317,10 @@ fn create_svsm_igvm(in_filename: &str, out_filename: &str) {
             0,
             1,
             SVSM_BASE,
-            SVSM_PAGETABLE,
-            SVSM_GDT,
-            gdt_limit,
+            SVSM_STACK - 24,
+            0,
+            0,
+            0,
             vp_index,
         ));
     }
@@ -298,7 +350,7 @@ fn main() {
     ];
     */
     if args.len() != 3 {
-        println!("Usage igvm_svsm /path/to/svsm.bin /path/to/out.igvm");
+        println!("Usage igvm_svsm /path/to/svsm_base_dir /path/to/out.igvm");
         return;
     }
     println!("Saving file as svsm.igvm");

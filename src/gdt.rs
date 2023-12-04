@@ -12,6 +12,7 @@ use zerocopy::AsBytes;
 #[repr(transparent)]
 struct Gdt([u64; 512]);
 
+#[allow(dead_code)]
 pub fn new_gdt(gdt_gpa: u64, pages: &mut Vec<IgvmDirectiveHeader>) -> u16 {
     let mut entries = [0u64; 512];
     entries[0] = 0;

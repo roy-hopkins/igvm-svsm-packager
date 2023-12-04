@@ -9,16 +9,18 @@ use igvm::{
     IgvmDirectiveHeader,
 };
 
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn new_vp_context_32(
     gpa: u64,
     compatibility_mask: u32,
     rip: u64,
+    rsp: u64,
     cr3: u64,
     gdt_base: u64,
     gdt_limit: u16,
     vp_index: u16,
 ) -> IgvmDirectiveHeader {
-    let mut vmsa = Box::new(SevVmsa {
+    let vmsa = Box::new(SevVmsa {
         es: SevSelector {
             selector: 16,
             attrib: 0xc093,
@@ -107,7 +109,7 @@ pub fn new_vp_context_32(
         dr2_addr_mask: 0,
         dr3_addr_mask: 0,
         vmsa_reserved4: [0; 3],
-        rsp: 0,
+        rsp,
         s_cet: 0,
         ssp: 0,
         interrupt_ssp_table_addr: 0,
@@ -176,23 +178,25 @@ pub fn new_vp_context_32(
         ymm_registers: [SevXmmRegister { low: 0, high: 0 }; 16],
     });
     IgvmDirectiveHeader::SnpVpContext {
-        gpa: 0,
+        gpa,
         compatibility_mask,
         vp_index,
         vmsa,
     }
 }
 
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn new_vp_context_64(
     gpa: u64,
     compatibility_mask: u32,
     rip: u64,
+    rsp: u64,
     cr3: u64,
     gdt_base: u64,
     gdt_limit: u16,
     vp_index: u16,
 ) -> IgvmDirectiveHeader {
-    let mut vmsa = Box::new(SevVmsa {
+    let vmsa = Box::new(SevVmsa {
         es: SevSelector {
             selector: 0x20,
             attrib: 0xa093,
@@ -281,7 +285,7 @@ pub fn new_vp_context_64(
         dr2_addr_mask: 0,
         dr3_addr_mask: 0,
         vmsa_reserved4: [0; 3],
-        rsp: 0,
+        rsp,
         s_cet: 0,
         ssp: 0,
         interrupt_ssp_table_addr: 0,
@@ -350,7 +354,7 @@ pub fn new_vp_context_64(
         ymm_registers: [SevXmmRegister { low: 0, high: 0 }; 16],
     });
     IgvmDirectiveHeader::SnpVpContext {
-        gpa: 0,
+        gpa,
         compatibility_mask,
         vp_index,
         vmsa,
