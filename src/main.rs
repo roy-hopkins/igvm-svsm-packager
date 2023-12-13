@@ -32,6 +32,10 @@ const SECRETS_PAGE: u32 = 632 * 1024;
 const KERNEL_REGION_BASE: u64 = 512 * (1u64 << 30);
 const KERNEL_REGION_SIZE: u64 = 256 * (1u64 << 20);
 
+// Parameter area indices
+const IGVM_MEMORY_MAP_PA: u32 = 1;
+const IGVM_HV_PARAMS_PA: u32 = 2;
+
 #[repr(C)]
 #[derive(AsBytes)]
 struct SvsmHeap {
@@ -274,6 +278,61 @@ fn add_pages_from_file(
     page_count
 }
 
+fn add_memory_map(gpa: u64, directive: &mut Vec<IgvmDirectiveHeader>) {
+    let param_area = IgvmDirectiveHeader::ParameterArea {
+        number_of_bytes: 0x1000,
+        parameter_area_index: IGVM_MEMORY_MAP_PA,
+        initial_data: vec![],
+    };
+    let mm = IgvmDirectiveHeader::MemoryMap(IGVM_VHS_PARAMETER {
+        parameter_area_index: IGVM_MEMORY_MAP_PA,
+        byte_offset: 0,
+    });
+    let param_insert = IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
+        gpa,
+        compatibility_mask: 1,
+        parameter_area_index: IGVM_MEMORY_MAP_PA,
+    });
+
+    // Order is important here. You need to declare the area, populate it
+    // then insert it.
+    directive.push(param_area);
+    directive.push(mm);
+    directive.push(param_insert);
+
+    report_range("memory map", gpa, 1);
+}
+
+fn add_params(gpa: u64, directive: &mut Vec<IgvmDirectiveHeader>) {
+    let param_area = IgvmDirectiveHeader::ParameterArea {
+        number_of_bytes: 0x1000,
+        parameter_area_index: IGVM_HV_PARAMS_PA,
+        initial_data: vec![],
+    };
+    let vp_count = IgvmDirectiveHeader::VpCount(IGVM_VHS_PARAMETER {
+        parameter_area_index: IGVM_HV_PARAMS_PA,
+        byte_offset: 0,
+    });
+    let shared = IgvmDirectiveHeader::MemoryState(IGVM_VHS_PARAMETER {
+        parameter_area_index: IGVM_HV_PARAMS_PA,
+        byte_offset: 4,
+    });
+    let param_insert = IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
+        gpa,
+        compatibility_mask: 1,
+        parameter_area_index: IGVM_HV_PARAMS_PA,
+    });
+
+    // Order is important here. You need to declare the area, populate it
+    // then insert it.
+    directive.push(param_area);
+    directive.push(vp_count);
+    directive.push(shared);
+    directive.push(param_insert);
+
+    report_range("params", gpa, 1);
+}
+
 fn create_svsm_igvm(in_path: &str, out_filename: &str) {
     let stage2_path = in_path.to_string() + "/stage2.bin";
     let kernel_path = in_path.to_string() + "/kernel.elf";
@@ -288,7 +347,9 @@ fn create_svsm_igvm(in_path: &str, out_filename: &str) {
     let ramfs_pages = add_pages_from_file(&ramfs_path, ramfs_base, &mut directive);
 
     let params = IgvmParamBlock {
-        param_page: 0,
+        param_area_size: 3 * 0x1000,
+        param_page_offset: 2 * 0x1000,
+        memory_map_offset: 0x1000,
         cpuid_page: CPUID_PAGE,
         secrets_page: SECRETS_PAGE,
         memory_map: 0,
@@ -310,6 +371,11 @@ fn create_svsm_igvm(in_path: &str, out_filename: &str) {
 
     // Add the SVSM heap memory
     add_svsm_kernel_region(1, &mut directive);
+
+    // Reserve space for the memory map. The IGVM loader will populate the parameter
+    // area with the actual memory map data.
+    add_memory_map(mm_base, &mut directive);
+
 
     // Initial CPU state
     for vp_index in 0..8 {
