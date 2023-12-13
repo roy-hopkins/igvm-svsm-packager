@@ -26,9 +26,17 @@ pub struct IgvmParamBlock {
 
     /// The guest physical address of the secrets page.
     pub secrets_page: u32,
-    pub memory_map: u32,
-    pub launch_fw: u8,
-    pub _reserved: [u8; 3],
+
+    /// The guest physical address of the start of the guest firmware. The
+    /// permissions on the pages in the firmware range are adjusted to the guest
+    /// VMPL.
+    pub fw_start: u32,
+
+    /// The number of pages of guest firmware. If the firmware size is zero then
+    /// no firmware is launched after initialization is complete.
+    pub fw_size: u32,
+
+    /// The number of bytes in the kernel memory region.
     pub kernel_size: u32,
 
     /// The guest physical address of the base of the kernel memory region.

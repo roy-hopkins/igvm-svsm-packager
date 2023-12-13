@@ -6,8 +6,8 @@
 
 use igvm::{IgvmDirectiveHeader, IgvmFile, IgvmPlatformHeader, IgvmRevision};
 use igvm_defs::{
-    IgvmPageDataFlags, IgvmPageDataType, IgvmPlatformType, IGVM_VHS_SUPPORTED_PLATFORM,
-    PAGE_SIZE_4K,
+    IgvmPageDataFlags, IgvmPageDataType, IgvmPlatformType, IGVM_VHS_PARAMETER,
+    IGVM_VHS_PARAMETER_INSERT, IGVM_VHS_SUPPORTED_PLATFORM, PAGE_SIZE_4K,
 };
 use igvm_param_defs::IgvmParamBlock;
 use std::{
@@ -23,10 +23,13 @@ mod igvm_param_defs;
 mod pagetable;
 mod vpcontext;
 
-const SVSM_BASE: u64 = 0x10000;
 const KERNEL_BASE: u64 = 0xff000000;
-const IGVM_PARAMS: u64 = SVSM_BASE - 0x1000;
-const SVSM_STACK: u64 = IGVM_PARAMS;
+
+const SVSM_BASE: u64 = 0x10000;
+const SVSM_STACK: u64 = SVSM_BASE;
+
+const OVMF_CODE_TOP: u64 = 0x100000000;
+
 const CPUID_PAGE: u32 = 636 * 1024;
 const SECRETS_PAGE: u32 = 632 * 1024;
 const KERNEL_REGION_BASE: u64 = 512 * (1u64 << 30);
@@ -147,6 +150,10 @@ impl Default for VmcbSaveArea {
     }
 }
 
+fn report_range(desc: &str, gpa: u64, pages: u32) {
+    println!("Added pages: {} gpa: {:#x} count: {:#x}", desc, gpa, pages);
+}
+
 fn new_platform(compatibility_mask: u32, platform_type: IgvmPlatformType) -> IgvmPlatformHeader {
     IgvmPlatformHeader::SupportedPlatform(IGVM_VHS_SUPPORTED_PLATFORM {
         compatibility_mask,
@@ -167,12 +174,12 @@ fn new_page_data(gpa: u64, compatibility_mask: u32, data: Vec<u8>) -> IgvmDirect
     }
 }
 
-fn add_metadata_pages(params: &IgvmParamBlock, pages: &mut Vec<IgvmDirectiveHeader>) {
+fn add_metadata_pages(params: &IgvmParamBlock, gpa: u64, pages: &mut Vec<IgvmDirectiveHeader>) {
     let flags = IgvmPageDataFlags::new();
 
     // IGVM Parameters
     pages.push(IgvmDirectiveHeader::PageData {
-        gpa: IGVM_PARAMS,
+        gpa,
         compatibility_mask: 1,
         flags,
         data_type: IgvmPageDataType::NORMAL,
@@ -224,11 +231,12 @@ fn add_stack_page(
     params: &IgvmParamBlock,
     directive: &mut Vec<IgvmDirectiveHeader>,
     kernel_pages: u32,
+    params_gpa: u32,
 ) {
     let mut stack = vec![0; 4096];
     unsafe {
         let p = stack.as_mut_ptr() as *mut u32;
-        p.offset(1022).write(IGVM_PARAMS as u32);
+        p.offset(1022).write(params_gpa);
         p.offset(1021).write(params.fs_base as u32 + params.fs_size);
         p.offset(1020).write(params.fs_base as u32);
         p.offset(1019)
@@ -236,6 +244,7 @@ fn add_stack_page(
         p.offset(1018).write(KERNEL_BASE as u32);
     }
     directive.push(new_page_data(SVSM_STACK - 0x1000, 1, stack));
+    report_range("stack", SVSM_STACK - 0x1000, 1);
 }
 
 fn add_svsm_kernel_region(compatibility_mask: u32, pages: &mut Vec<IgvmDirectiveHeader>) {
@@ -260,11 +269,21 @@ fn add_pages_from_file(
     path: &String,
     gpa_base: u64,
     directive: &mut Vec<IgvmDirectiveHeader>,
+    align_top: bool,
 ) -> u32 {
     let mut gpa = gpa_base;
     let mut in_file = File::open(path).expect("Could not open input file");
     let mut buf = vec![0; 4096];
     let mut page_count = 0;
+
+    if align_top {
+        let file_length = in_file
+            .metadata()
+            .expect("Failed to query input file length")
+            .len();
+        let offset: u64 = (file_length + 0xfff) & !0xfff;
+        gpa = gpa_base - offset;
+    }
 
     while let Ok(len) = in_file.read(&mut buf) {
         if len == 0 {
@@ -275,6 +294,11 @@ fn add_pages_from_file(
         buf = vec![0; 4096];
         page_count += 1;
     }
+    report_range(
+        path.as_str(),
+        gpa - (page_count as u64 * 0x1000),
+        page_count,
+    );
     page_count
 }
 
@@ -337,14 +361,30 @@ fn create_svsm_igvm(in_path: &str, out_filename: &str) {
     let stage2_path = in_path.to_string() + "/stage2.bin";
     let kernel_path = in_path.to_string() + "/kernel.elf";
     let ramfs_path = in_path.to_string() + "/svsm-fs.bin";
+    let ovmf_code_path = in_path.to_string() + "/OVMF_CODE.fd";
+    let ovmf_vars_path = in_path.to_string() + "/OVMF_VARS.fd";
     let mut directive: Vec<IgvmDirectiveHeader> = vec![];
 
     // Populate stage2, the kernel elf and the file system consecutively from
     // the base address.
-    let stage2_pages = add_pages_from_file(&stage2_path, SVSM_BASE, &mut directive);
-    let kernel_pages = add_pages_from_file(&kernel_path, KERNEL_BASE, &mut directive);
+    let stage2_pages = add_pages_from_file(&stage2_path, SVSM_BASE, &mut directive, false);
+    let kernel_pages = add_pages_from_file(&kernel_path, KERNEL_BASE, &mut directive, false);
     let ramfs_base = KERNEL_BASE + kernel_pages as u64 * 0x1000;
-    let ramfs_pages = add_pages_from_file(&ramfs_path, ramfs_base, &mut directive);
+    let ramfs_pages = add_pages_from_file(&ramfs_path, ramfs_base, &mut directive, false);
+    let mut ovmf_pages = add_pages_from_file(&ovmf_code_path, OVMF_CODE_TOP, &mut directive, true);
+    ovmf_pages += add_pages_from_file(
+        &ovmf_vars_path,
+        OVMF_CODE_TOP - ovmf_pages as u64 * 0x1000,
+        &mut directive,
+        true,
+    );
+
+    // IGVM parameters - hardcoded parameters defined in this file
+    let params_base = ramfs_base + ramfs_pages as u64 * 0x1000;
+    // Placeholder for the hypervisor to populate the memory map
+    let mm_base = params_base + 0x1000;
+    // Placeholder for parameters that must be set by the hypervisor
+    let hv_params_base = mm_base + 0x1000;
 
     let params = IgvmParamBlock {
         param_area_size: 3 * 0x1000,
@@ -352,9 +392,8 @@ fn create_svsm_igvm(in_path: &str, out_filename: &str) {
         memory_map_offset: 0x1000,
         cpuid_page: CPUID_PAGE,
         secrets_page: SECRETS_PAGE,
-        memory_map: 0,
-        launch_fw: 1,
-        _reserved: [0; 3],
+        fw_start: (OVMF_CODE_TOP - (ovmf_pages as u64 * 0x1000)) as u32,
+        fw_size: ovmf_pages,
         kernel_size: KERNEL_REGION_SIZE as u32,
         kernel_base: KERNEL_REGION_BASE,
         stage2_size: stage2_pages * 0x1000,
@@ -364,10 +403,16 @@ fn create_svsm_igvm(in_path: &str, out_filename: &str) {
     };
 
     // Add the metadata using the special page types
-    add_metadata_pages(&params, &mut directive);
+    add_metadata_pages(&params, params_base, &mut directive);
 
-    // Create the initial stage 2 stack
-    add_stack_page(&params, &mut directive, kernel_pages);
+    // Create the initial stage 2 stack - remembering to add on the parameter pages
+    // to the kernel page count.
+    add_stack_page(
+        &params,
+        &mut directive,
+        kernel_pages + 3,
+        params_base as u32,
+    );
 
     // Add the SVSM heap memory
     add_svsm_kernel_region(1, &mut directive);
@@ -376,6 +421,7 @@ fn create_svsm_igvm(in_path: &str, out_filename: &str) {
     // area with the actual memory map data.
     add_memory_map(mm_base, &mut directive);
 
+    add_params(hv_params_base, &mut directive);
 
     // Initial CPU state
     for vp_index in 0..8 {
