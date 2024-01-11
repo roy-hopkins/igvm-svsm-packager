@@ -6,7 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-igvm_defs = { path = '../ms_igvm/igvm_defs' }
-igvm = { path = '../ms_igvm/igvm' }
+igvm_defs = { path = '../igvm/igvm_defs' }
+igvm = { path = '../igvm/igvm' }
 zerocopy = "0.6"
 bitflags = "2.4"

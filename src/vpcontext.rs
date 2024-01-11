@@ -23,31 +23,31 @@ pub fn new_vp_context_32(
     let vmsa = Box::new(SevVmsa {
         es: SevSelector {
             selector: 16,
-            attrib: 0xc093,
+            attrib: 0xc93,
             limit: 0xffffffff,
             base: 0,
         },
         cs: SevSelector {
             selector: 8,
-            attrib: 0xc09b,
+            attrib: 0xc9b,
             limit: 0xffffffff,
             base: 0,
         },
         ss: SevSelector {
             selector: 16,
-            attrib: 0xc093,
+            attrib: 0xc93,
             limit: 0xffffffff,
             base: 0,
         },
         ds: SevSelector {
             selector: 16,
-            attrib: 0xc093,
+            attrib: 0xc93,
             limit: 0xffffffff,
             base: 0,
         },
         fs: SevSelector {
             selector: 16,
-            attrib: 0xc093,
+            attrib: 0xc93,
             limit: 0xffffffff,
             base: 0,
         },

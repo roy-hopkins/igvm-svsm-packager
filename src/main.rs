@@ -337,7 +337,7 @@ fn add_params(gpa: u64, directive: &mut Vec<IgvmDirectiveHeader>) {
         parameter_area_index: IGVM_HV_PARAMS_PA,
         byte_offset: 0,
     });
-    let shared = IgvmDirectiveHeader::MemoryState(IGVM_VHS_PARAMETER {
+    let shared = IgvmDirectiveHeader::EnvironmentInfo(IGVM_VHS_PARAMETER {
         parameter_area_index: IGVM_HV_PARAMS_PA,
         byte_offset: 4,
     });
@@ -400,6 +400,11 @@ fn create_svsm_igvm(in_path: &str, out_filename: &str) {
         stage2_base: SVSM_BASE,
         fs_size: ramfs_pages * 0x1000,
         fs_base: ramfs_base,
+        kernel_reserved_size: 0,
+        fw_metadata: (OVMF_CODE_TOP - 0x1000) as u32,
+        debug_serial_port: 0x3f8,
+        _reserved: 0,
+        _reserved2: 0,
     };
 
     // Add the metadata using the special page types
@@ -424,7 +429,7 @@ fn create_svsm_igvm(in_path: &str, out_filename: &str) {
     add_params(hv_params_base, &mut directive);
 
     // Initial CPU state
-    for vp_index in 0..8 {
+    for vp_index in 0..1 {
         directive.push(new_vp_context_32(
             0,
             1,

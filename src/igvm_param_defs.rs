@@ -27,14 +27,31 @@ pub struct IgvmParamBlock {
     /// The guest physical address of the secrets page.
     pub secrets_page: u32,
 
+    /// The port number of the serial port to use for debugging.
+    pub debug_serial_port: u16,
+
+    pub _reserved: u16,
+
     /// The guest physical address of the start of the guest firmware. The
     /// permissions on the pages in the firmware range are adjusted to the guest
-    /// VMPL.
+    /// VMPL. If this field is zero then no firmware is launched after
+    /// initialization is complete.
     pub fw_start: u32,
 
     /// The number of pages of guest firmware. If the firmware size is zero then
     /// no firmware is launched after initialization is complete.
     pub fw_size: u32,
+
+    /// The guest physical address of the page that contains metadata that
+    /// corresponds to the firmware. The SVSM expects the page to contain
+    /// metadata in the format defined by OVMF.
+    pub fw_metadata: u32,
+
+    pub _reserved2: u32,
+
+    /// The amount of space that must be reserved at the base of the kernel
+    /// memory region (e.g. for VMSA contents).
+    pub kernel_reserved_size: u32,
 
     /// The number of bytes in the kernel memory region.
     pub kernel_size: u32,
