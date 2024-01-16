@@ -4,154 +4,103 @@
 //
 // Author: Roy Hopkins <rhopkins@suse.de>
 
+use clap::{Parser, ValueEnum};
+use igvm::snp_defs::{SevFeatures, SevVmsa};
 use igvm::{IgvmDirectiveHeader, IgvmFile, IgvmPlatformHeader, IgvmRevision};
 use igvm_defs::{
     IgvmPageDataFlags, IgvmPageDataType, IgvmPlatformType, IGVM_VHS_PARAMETER,
     IGVM_VHS_PARAMETER_INSERT, IGVM_VHS_SUPPORTED_PLATFORM, PAGE_SIZE_4K,
 };
-use igvm_param_defs::IgvmParamBlock;
-use std::{
-    env,
-    fs::File,
-    io::{Read, Write},
-};
-use vpcontext::new_vp_context_32;
+use igvm_params::{IgvmParamBlock, IgvmParamBlockFwInfo};
+use ovmfmeta::parse_ovmf_metadata;
+use std::cmp;
+use std::error::Error;
+use std::fs::metadata;
+use std::io::Write;
+use std::mem::size_of;
+use std::process::exit;
+use std::{fs::File, io::Read};
 use zerocopy::AsBytes;
+use zerocopy::FromZeroes;
 
 mod gdt;
-mod igvm_param_defs;
+mod igvm_params;
+mod ovmfmeta;
 mod pagetable;
 mod vpcontext;
 
-const KERNEL_BASE: u64 = 0xff000000;
+const COMPATIBILITY_MASK: u32 = 1;
 
-const SVSM_BASE: u64 = 0x10000;
-const SVSM_STACK: u64 = SVSM_BASE;
-
-const OVMF_CODE_TOP: u64 = 0x100000000;
-
-const CPUID_PAGE: u32 = 636 * 1024;
-const SECRETS_PAGE: u32 = 632 * 1024;
-const KERNEL_REGION_BASE: u64 = 512 * (1u64 << 30);
-const KERNEL_REGION_SIZE: u64 = 256 * (1u64 << 20);
+const SECRETS_PAGE: u32 = 0x9e000;
+const CPUID_PAGE: u32 = 0x9f000;
 
 // Parameter area indices
+const IGVM_GENERAL_PARAMS_PA: u32 = 0;
 const IGVM_MEMORY_MAP_PA: u32 = 1;
-const IGVM_HV_PARAMS_PA: u32 = 2;
 
-#[repr(C)]
+#[derive(Parser, Debug)]
+struct Args {
+    /// Stage 2 binary file
+    #[arg(short, long)]
+    stage2: String,
+
+    /// Kernel elf file
+    #[arg(short, long)]
+    kernel: String,
+
+    /// Optional filesystem image
+    #[arg(long)]
+    filesystem: Option<String>,
+
+    /// Optional firmware file, e.g. OVMF.fd
+    #[arg(short, long)]
+    firmware: Option<String>,
+
+    /// Output filename for the generated IGVM file
+    #[arg(short, long)]
+    output: String,
+
+    /// COM port to use for the SVSM console. Valid values are 1-4
+    #[arg(short, long, default_value_t = 1, value_parser = clap::value_parser!(i32).range(1..=4))]
+    comport: i32,
+
+    /// Hypervisor to generate IGVM file for
+    #[arg(value_enum)]
+    hypervisor: Hypervisor,
+
+    /// Print verbose output
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+enum Hypervisor {
+    /// Build an IGVM file compatible with QEMU
+    QEMU,
+
+    /// Build an IGVM file compatible with Hyper-V
+    HyperV,
+}
+
+#[repr(C, packed(1))]
 #[derive(AsBytes)]
-struct SvsmHeap {
-    pub base: u64,
-    pub size: u64,
+struct Stage2Stack {
+    pub kernel_start: u32,
+    pub kernel_end: u32,
+    pub filesystem_start: u32,
+    pub filesystem_end: u32,
+    pub igvm_param_block: u32,
+    pub reserved: u32,
 }
 
-#[repr(C, packed(1))]
-#[derive(Default)]
-struct VmcbSeg {
-    pub selector: u64,
-    pub attrib: u16,
-    pub limit: u32,
-    pub base: u64,
-}
-
-#[repr(C, packed(1))]
-struct VmcbSaveArea {
-    es: VmcbSeg,
-    cs: VmcbSeg,
-    ss: VmcbSeg,
-    ds: VmcbSeg,
-    fs: VmcbSeg,
-    gs: VmcbSeg,
-    gdtr: VmcbSeg,
-    ldtr: VmcbSeg,
-    idtr: VmcbSeg,
-    tr: VmcbSeg,
-    reserved_1: [u8; 43],
-    cpl: u8,
-    reserved_2: [u8; 4],
-    efer: u64,
-    reserved_3: [u8; 112],
-    cr4: u64,
-    cr3: u64,
-    cr0: u64,
-    dr7: u64,
-    dr6: u64,
-    rflags: u64,
-    rip: u64,
-    reserved_4: [u8; 88],
-    rsp: u64,
-    reserved_5: [u8; 24],
-    rax: u64,
-    star: u64,
-    lstar: u64,
-    cstar: u64,
-    sfmask: u64,
-    kernel_gs_base: u64,
-    sysenter_cs: u64,
-    sysenter_esp: u64,
-    sysenter_eip: u64,
-    cr2: u64,
-    reserved_6: [u8; 32],
-    g_pat: u64,
-    dbgctl: u64,
-    br_from: u64,
-    bro: u64,
-    last_excp_from: u64,
-    last_excp_to: u64,
-}
-
-impl Default for VmcbSaveArea {
-    fn default() -> Self {
-        Self {
-            es: Default::default(),
-            cs: Default::default(),
-            ss: Default::default(),
-            ds: Default::default(),
-            fs: Default::default(),
-            gs: Default::default(),
-            gdtr: Default::default(),
-            ldtr: Default::default(),
-            idtr: Default::default(),
-            tr: Default::default(),
-            reserved_1: [0; 43],
-            cpl: Default::default(),
-            reserved_2: Default::default(),
-            efer: Default::default(),
-            reserved_3: [0; 112],
-            cr4: Default::default(),
-            cr3: Default::default(),
-            cr0: Default::default(),
-            dr7: Default::default(),
-            dr6: Default::default(),
-            rflags: Default::default(),
-            rip: Default::default(),
-            reserved_4: [0; 88],
-            rsp: Default::default(),
-            reserved_5: Default::default(),
-            rax: Default::default(),
-            star: Default::default(),
-            lstar: Default::default(),
-            cstar: Default::default(),
-            sfmask: Default::default(),
-            kernel_gs_base: Default::default(),
-            sysenter_cs: Default::default(),
-            sysenter_esp: Default::default(),
-            sysenter_eip: Default::default(),
-            cr2: Default::default(),
-            reserved_6: Default::default(),
-            g_pat: Default::default(),
-            dbgctl: Default::default(),
-            br_from: Default::default(),
-            bro: Default::default(),
-            last_excp_from: Default::default(),
-            last_excp_to: Default::default(),
-        }
+fn port_address(port: i32) -> u16 {
+    match port {
+        1 => 0x3f8,
+        2 => 0x2f8,
+        3 => 0x3e8,
+        4 => 0x2e8,
+        _ => 0,
     }
-}
-
-fn report_range(desc: &str, gpa: u64, pages: u32) {
-    println!("Added pages: {} gpa: {:#x} count: {:#x}", desc, gpa, pages);
 }
 
 fn new_platform(compatibility_mask: u32, platform_type: IgvmPlatformType) -> IgvmPlatformHeader {
@@ -174,148 +123,235 @@ fn new_page_data(gpa: u64, compatibility_mask: u32, data: Vec<u8>) -> IgvmDirect
     }
 }
 
-fn add_metadata_pages(params: &IgvmParamBlock, gpa: u64, pages: &mut Vec<IgvmDirectiveHeader>) {
-    let flags = IgvmPageDataFlags::new();
+fn default_param_block(args: &Args) -> IgvmParamBlock {
+    let param_page_offset = PAGE_SIZE_4K as u32;
+    let memory_map_offset = param_page_offset + PAGE_SIZE_4K as u32;
+    let memory_map_end_offset = memory_map_offset + PAGE_SIZE_4K as u32;
 
-    // IGVM Parameters
-    pages.push(IgvmDirectiveHeader::PageData {
-        gpa,
-        compatibility_mask: 1,
-        flags,
-        data_type: IgvmPageDataType::NORMAL,
-        data: params.as_bytes().to_vec(),
-    });
-
-    // SEV_DESC_TYPE_SNP_SEC_MEM
-    for index in 0..((SVSM_STACK - 0x1000) / PAGE_SIZE_4K) {
-        pages.push(IgvmDirectiveHeader::PageData {
-            gpa: index * PAGE_SIZE_4K,
-            compatibility_mask: 1,
-            flags,
-            data_type: IgvmPageDataType::NORMAL,
-            data: vec![],
-        });
+    IgvmParamBlock {
+        param_area_size: memory_map_end_offset,
+        param_page_offset,
+        memory_map_offset,
+        guest_context_offset: 0,
+        cpuid_page: CPUID_PAGE,
+        secrets_page: SECRETS_PAGE,
+        debug_serial_port: port_address(args.comport),
+        _reserved: [0u16; 3],
+        firmware: IgvmParamBlockFwInfo::default(),
+        kernel_reserved_size: 0,
+        kernel_size: 0,
+        kernel_base: 0,
+        vtom: 0,
     }
-    for index in ((params.stage2_base + params.stage2_size as u64) / PAGE_SIZE_4K)
-        ..(SECRETS_PAGE as u64 / PAGE_SIZE_4K)
-    {
-        pages.push(IgvmDirectiveHeader::PageData {
-            gpa: index * PAGE_SIZE_4K,
-            compatibility_mask: 1,
-            flags,
-            data_type: IgvmPageDataType::NORMAL,
-            data: vec![],
-        });
-    }
-
-    // SEV_DESC_TYPE_SNP_SECRETS
-    pages.push(IgvmDirectiveHeader::PageData {
-        gpa: SECRETS_PAGE as u64,
-        compatibility_mask: 1,
-        flags,
-        data_type: IgvmPageDataType::SECRETS,
-        data: vec![],
-    });
-
-    // SEV_DESC_TYPE_CPUID
-    pages.push(IgvmDirectiveHeader::PageData {
-        gpa: CPUID_PAGE as u64,
-        compatibility_mask: 1,
-        flags,
-        data_type: IgvmPageDataType::CPUID_DATA,
-        data: vec![],
-    });
 }
 
-fn add_stack_page(
-    params: &IgvmParamBlock,
-    directive: &mut Vec<IgvmDirectiveHeader>,
-    kernel_pages: u32,
-    params_gpa: u32,
+fn construct_initial_vmsa(args: &Args, start_gpa: u64, directives: &mut Vec<IgvmDirectiveHeader>) {
+    let mut vmsa_box = SevVmsa::new_box_zeroed();
+    let vmsa = vmsa_box.as_mut();
+
+    // Establish CS as a 32-bit code selector.
+    vmsa.cs.attrib = 0xc9b;
+    vmsa.cs.limit = 0xffffffff;
+    vmsa.cs.selector = 0x08;
+
+    // Establish all data segments as generic data selectors.
+    vmsa.ds.attrib = 0xa93;
+    vmsa.ds.limit = 0xffffffff;
+    vmsa.ds.selector = 0x10;
+    vmsa.ss = vmsa.ds;
+    vmsa.es = vmsa.ds;
+    vmsa.fs = vmsa.ds;
+    vmsa.gs = vmsa.ds;
+
+    // EFER.SVME.
+    vmsa.efer = 0x1000;
+
+    // CR0.PE | CR0.NE.
+    vmsa.cr0 = 0x21;
+
+    // CR4.MCE.
+    vmsa.cr4 = 0x40;
+
+    vmsa.pat = 0x0007040600070406;
+    vmsa.xcr0 = 1;
+    vmsa.rflags = 2;
+    vmsa.rip = 0x10000;
+    vmsa.rsp = vmsa.rip - size_of::<Stage2Stack>() as u64;
+
+    let mut features = SevFeatures::new();
+    features.set_snp(true);
+    features.set_restrict_injection(true);
+    vmsa.sev_features = features;
+
+    directives.push(IgvmDirectiveHeader::SnpVpContext {
+        gpa: start_gpa,
+        compatibility_mask: COMPATIBILITY_MASK,
+        vp_index: 0,
+        vmsa: vmsa_box,
+    });
+
+    if args.verbose {
+        println!(
+            "{:#010x}-{:#010x} VMSA",
+            start_gpa,
+            start_gpa + PAGE_SIZE_4K
+        );
+    }
+}
+
+fn construct_empty_pages(
+    args: &Args,
+    start_gpa: u64,
+    size: u64,
+    data_type: IgvmPageDataType,
+    directives: &mut Vec<IgvmDirectiveHeader>,
+    description: &str,
 ) {
-    let mut stack = vec![0; 4096];
-    unsafe {
-        let p = stack.as_mut_ptr() as *mut u32;
-        p.offset(1022).write(params_gpa);
-        p.offset(1021).write(params.fs_base as u32 + params.fs_size);
-        p.offset(1020).write(params.fs_base as u32);
-        p.offset(1019)
-            .write(KERNEL_BASE as u32 + kernel_pages * 0x1000);
-        p.offset(1018).write(KERNEL_BASE as u32);
+    if args.verbose {
+        println!(
+            "{:#010x}-{:#010x} \"{}\" empty data",
+            start_gpa,
+            start_gpa + size,
+            description
+        );
     }
-    directive.push(new_page_data(SVSM_STACK - 0x1000, 1, stack));
-    report_range("stack", SVSM_STACK - 0x1000, 1);
-}
-
-fn add_svsm_kernel_region(compatibility_mask: u32, pages: &mut Vec<IgvmDirectiveHeader>) {
-    let mut gpa = KERNEL_REGION_BASE;
-    let mut flags = IgvmPageDataFlags::new();
-    flags.set_is_2mb_page(true);
-    flags.set_unmeasured(true);
-
-    while gpa < (KERNEL_REGION_BASE + KERNEL_REGION_SIZE) {
-        pages.push(IgvmDirectiveHeader::PageData {
+    for gpa in (start_gpa..(start_gpa + size)).step_by(PAGE_SIZE_4K as usize) {
+        directives.push(IgvmDirectiveHeader::PageData {
             gpa,
-            compatibility_mask,
-            flags,
-            data_type: IgvmPageDataType::NORMAL,
+            compatibility_mask: COMPATIBILITY_MASK,
+            flags: IgvmPageDataFlags::new(),
+            data_type,
             data: vec![],
         });
-        gpa += 0x200000;
     }
 }
 
-fn add_pages_from_file(
+fn construct_data_pages(
+    args: &Args,
+    start_gpa: u64,
+    data: &[u8],
+    directives: &mut Vec<IgvmDirectiveHeader>,
+    description: &str,
+) {
+    if args.verbose {
+        println!(
+            "{:#010x}-{:#010x} \"{}\" mem data",
+            start_gpa,
+            start_gpa + data.len() as u64,
+            description
+        );
+    }
+    for offset in (0..data.len()).step_by(PAGE_SIZE_4K as usize) {
+        let page = data[offset..(offset + PAGE_SIZE_4K as usize)].to_vec();
+        directives.push(IgvmDirectiveHeader::PageData {
+            gpa: start_gpa + offset as u64,
+            compatibility_mask: COMPATIBILITY_MASK,
+            flags: IgvmPageDataFlags::new(),
+            data_type: IgvmPageDataType::NORMAL,
+            data: page,
+        });
+    }
+}
+
+fn construct_data_pages_from_file(
+    args: &Args,
     path: &String,
     gpa_base: u64,
-    directive: &mut Vec<IgvmDirectiveHeader>,
-    align_top: bool,
-) -> u32 {
+    directives: &mut Vec<IgvmDirectiveHeader>,
+) -> u64 {
     let mut gpa = gpa_base;
     let mut in_file = File::open(path).expect("Could not open input file");
     let mut buf = vec![0; 4096];
-    let mut page_count = 0;
-
-    if align_top {
-        let file_length = in_file
-            .metadata()
-            .expect("Failed to query input file length")
-            .len();
-        let offset: u64 = (file_length + 0xfff) & !0xfff;
-        gpa = gpa_base - offset;
-    }
 
     while let Ok(len) = in_file.read(&mut buf) {
         if len == 0 {
             break;
         }
-        directive.push(new_page_data(gpa, 1, buf));
+        directives.push(new_page_data(gpa, 1, buf));
         gpa += PAGE_SIZE_4K;
         buf = vec![0; 4096];
-        page_count += 1;
     }
-    report_range(
-        path.as_str(),
-        gpa - (page_count as u64 * 0x1000),
-        page_count,
-    );
-    page_count
+    if args.verbose {
+        println!("{:#010x}-{:#010x} \"{}\" file data", gpa_base, gpa, path);
+    }
+    gpa - gpa_base
 }
 
-fn add_memory_map(gpa: u64, directive: &mut Vec<IgvmDirectiveHeader>) {
+fn construct_firmware_pages(
+    args: &Args,
+    param_block: &mut IgvmParamBlock,
+    directives: &mut Vec<IgvmDirectiveHeader>,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(firmware) = &args.firmware {
+        match args.hypervisor {
+            Hypervisor::QEMU => {
+                parse_ovmf_metadata(firmware, &mut param_block.firmware)?;
+                // OVMF must be located to end at 4GB.
+                let len = metadata(firmware)?.len() as usize;
+                if len > 0xffffffff {
+                    return Err("OVMF firmware is too large".into());
+                }
+                param_block.firmware.start = (0xffffffff - len + 1) as u32;
+                param_block.firmware.size = len as u32;
+                construct_data_pages_from_file(
+                    args,
+                    firmware,
+                    param_block.firmware.start as u64,
+                    directives,
+                );
+            }
+            Hypervisor::HyperV => todo!(),
+        }
+    }
+    Ok(())
+}
+
+fn construct_param_block(
+    args: &Args,
+    gpa: u64,
+    param_block: &IgvmParamBlock,
+    directives: &mut Vec<IgvmDirectiveHeader>,
+) -> Result<u64, Box<dyn Error>> {
+    // The param block contents are complete now. Populate the data page.
+    let param_block_data = unsafe {
+        let ptr = param_block as *const IgvmParamBlock as *const [u8; size_of::<IgvmParamBlock>()];
+        &*ptr
+    };
+    if param_block_data.len() > PAGE_SIZE_4K as usize {
+        return Err("IGVM parameter block size exceeds 4K".into());
+    }
+    let mut param_block_page = [0u8; PAGE_SIZE_4K as usize];
+    param_block_page[..param_block_data.len()].clone_from_slice(param_block_data);
+    construct_data_pages(
+        args,
+        gpa,
+        &param_block_page,
+        directives,
+        "IGVM parameter block",
+    );
+    Ok(PAGE_SIZE_4K)
+}
+
+fn construct_parameter_page(
+    args: &Args,
+    gpa: u64,
+    parameter_area_index: u32,
+    directive: &mut Vec<IgvmDirectiveHeader>,
+    description: &str,
+) {
     let param_area = IgvmDirectiveHeader::ParameterArea {
-        number_of_bytes: 0x1000,
-        parameter_area_index: IGVM_MEMORY_MAP_PA,
+        number_of_bytes: PAGE_SIZE_4K,
+        parameter_area_index,
         initial_data: vec![],
     };
     let mm = IgvmDirectiveHeader::MemoryMap(IGVM_VHS_PARAMETER {
-        parameter_area_index: IGVM_MEMORY_MAP_PA,
+        parameter_area_index,
         byte_offset: 0,
     });
     let param_insert = IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
         gpa,
         compatibility_mask: 1,
-        parameter_area_index: IGVM_MEMORY_MAP_PA,
+        parameter_area_index,
     });
 
     // Order is important here. You need to declare the area, populate it
@@ -324,152 +360,258 @@ fn add_memory_map(gpa: u64, directive: &mut Vec<IgvmDirectiveHeader>) {
     directive.push(mm);
     directive.push(param_insert);
 
-    report_range("memory map", gpa, 1);
-}
-
-fn add_params(gpa: u64, directive: &mut Vec<IgvmDirectiveHeader>) {
-    let param_area = IgvmDirectiveHeader::ParameterArea {
-        number_of_bytes: 0x1000,
-        parameter_area_index: IGVM_HV_PARAMS_PA,
-        initial_data: vec![],
-    };
-    let vp_count = IgvmDirectiveHeader::VpCount(IGVM_VHS_PARAMETER {
-        parameter_area_index: IGVM_HV_PARAMS_PA,
-        byte_offset: 0,
-    });
-    let shared = IgvmDirectiveHeader::EnvironmentInfo(IGVM_VHS_PARAMETER {
-        parameter_area_index: IGVM_HV_PARAMS_PA,
-        byte_offset: 4,
-    });
-    let param_insert = IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
-        gpa,
-        compatibility_mask: 1,
-        parameter_area_index: IGVM_HV_PARAMS_PA,
-    });
-
-    // Order is important here. You need to declare the area, populate it
-    // then insert it.
-    directive.push(param_area);
-    directive.push(vp_count);
-    directive.push(shared);
-    directive.push(param_insert);
-
-    report_range("params", gpa, 1);
-}
-
-fn create_svsm_igvm(in_path: &str, out_filename: &str) {
-    let stage2_path = in_path.to_string() + "/stage2.bin";
-    let kernel_path = in_path.to_string() + "/kernel.elf";
-    let ramfs_path = in_path.to_string() + "/svsm-fs.bin";
-    let ovmf_code_path = in_path.to_string() + "/OVMF_CODE.fd";
-    let ovmf_vars_path = in_path.to_string() + "/OVMF_VARS.fd";
-    let mut directive: Vec<IgvmDirectiveHeader> = vec![];
-
-    // Populate stage2, the kernel elf and the file system consecutively from
-    // the base address.
-    let stage2_pages = add_pages_from_file(&stage2_path, SVSM_BASE, &mut directive, false);
-    let kernel_pages = add_pages_from_file(&kernel_path, KERNEL_BASE, &mut directive, false);
-    let ramfs_base = KERNEL_BASE + kernel_pages as u64 * 0x1000;
-    let ramfs_pages = add_pages_from_file(&ramfs_path, ramfs_base, &mut directive, false);
-    let mut ovmf_pages = add_pages_from_file(&ovmf_code_path, OVMF_CODE_TOP, &mut directive, true);
-    ovmf_pages += add_pages_from_file(
-        &ovmf_vars_path,
-        OVMF_CODE_TOP - ovmf_pages as u64 * 0x1000,
-        &mut directive,
-        true,
-    );
-
-    // IGVM parameters - hardcoded parameters defined in this file
-    let params_base = ramfs_base + ramfs_pages as u64 * 0x1000;
-    // Placeholder for the hypervisor to populate the memory map
-    let mm_base = params_base + 0x1000;
-    // Placeholder for parameters that must be set by the hypervisor
-    let hv_params_base = mm_base + 0x1000;
-
-    let params = IgvmParamBlock {
-        param_area_size: 3 * 0x1000,
-        param_page_offset: 2 * 0x1000,
-        memory_map_offset: 0x1000,
-        cpuid_page: CPUID_PAGE,
-        secrets_page: SECRETS_PAGE,
-        fw_start: (OVMF_CODE_TOP - (ovmf_pages as u64 * 0x1000)) as u32,
-        fw_size: ovmf_pages,
-        kernel_size: KERNEL_REGION_SIZE as u32,
-        kernel_base: KERNEL_REGION_BASE,
-        stage2_size: stage2_pages * 0x1000,
-        stage2_base: SVSM_BASE,
-        fs_size: ramfs_pages * 0x1000,
-        fs_base: ramfs_base,
-        kernel_reserved_size: 0,
-        fw_metadata: (OVMF_CODE_TOP - 0x1000) as u32,
-        debug_serial_port: 0x3f8,
-        _reserved: 0,
-        _reserved2: 0,
-    };
-
-    // Add the metadata using the special page types
-    add_metadata_pages(&params, params_base, &mut directive);
-
-    // Create the initial stage 2 stack - remembering to add on the parameter pages
-    // to the kernel page count.
-    add_stack_page(
-        &params,
-        &mut directive,
-        kernel_pages + 3,
-        params_base as u32,
-    );
-
-    // Add the SVSM heap memory
-    add_svsm_kernel_region(1, &mut directive);
-
-    // Reserve space for the memory map. The IGVM loader will populate the parameter
-    // area with the actual memory map data.
-    add_memory_map(mm_base, &mut directive);
-
-    add_params(hv_params_base, &mut directive);
-
-    // Initial CPU state
-    for vp_index in 0..1 {
-        directive.push(new_vp_context_32(
-            0,
-            1,
-            SVSM_BASE,
-            SVSM_STACK - 24,
-            0,
-            0,
-            0,
-            vp_index,
-        ));
+    if args.verbose {
+        println!(
+            "{:#010x}-{:#010x} {} parameter",
+            gpa,
+            gpa + PAGE_SIZE_4K,
+            description
+        );
     }
+}
+
+fn print_fw_metadata(args: &Args, param_block: &IgvmParamBlock) {
+    if args.verbose {
+        println!("  firmware");
+        println!("    start: {:#X}", param_block.firmware.start);
+        println!("    size: {:#X}", param_block.firmware.size);
+        println!("    secrets_page: {:#X}", param_block.firmware.secrets_page);
+        println!("    caa_page: {:#X}", param_block.firmware.caa_page);
+        println!("    cpuid_page: {:#X}", param_block.firmware.cpuid_page);
+        println!("    reset_addr: {:#X}", param_block.firmware.reset_addr);
+        println!(
+            "    prevalidated_count: {:#X}",
+            param_block.firmware.prevalidated_count
+        );
+        for i in 0..param_block.firmware.prevalidated_count as usize {
+            println!(
+                "      prevalidate[{}].base: {:#X}",
+                i, param_block.firmware.prevalidated[i].base
+            );
+            println!(
+                "      prevalidate[{}].size: {:#X}",
+                i, param_block.firmware.prevalidated[i].size
+            );
+        }
+    }
+}
+
+fn print_param_block(args: &Args, param_block: &IgvmParamBlock) {
+    if args.verbose {
+        println!("igvm_parameter_block:");
+        println!("  param_area_size: {:#X}", param_block.param_area_size);
+        println!("  param_page_offset: {:#X}", param_block.param_page_offset);
+        println!("  memory_map_offset: {:#X}", param_block.memory_map_offset);
+        println!(
+            "  guest_context_offset: {:#X}",
+            param_block.guest_context_offset
+        );
+        println!("  cpuid_page: {:#X}", param_block.cpuid_page);
+        println!("  secrets_page: {:#X}", param_block.secrets_page);
+        println!("  debug_serial_port: {:#X}", param_block.debug_serial_port);
+        println!("  _reserved[3]: {:#X?}", param_block._reserved);
+        print_fw_metadata(args, param_block);
+        println!(
+            "  kernel_reserved_size: {:#X}",
+            param_block.kernel_reserved_size
+        );
+        println!("  kernel_size: {:#X}", param_block.kernel_size);
+        println!("  kernel_base: {:#X}", param_block.kernel_base);
+        println!("  vtom: {:#X}", param_block.vtom);
+    }
+}
+
+fn create_igvm(args: &Args) -> Result<(), Box<dyn Error>> {
+    let mut directives: Vec<IgvmDirectiveHeader> = vec![];
+    let mut param_block = default_param_block(args);
+
+    // This creates a file with the following guest memory layout:
+    //   0x000000-0x00EFFF: zero-filled (must be pre-validated)
+    //   0x00F000-0x00FFFF: initial stage 2 stack page
+    //   0x010000-0x0nnnnn: stage 2 image
+    //   0x0nnnnn-0x09DFFF: zero-filled (must be pre-validated)
+    //   0x09E000-0x09EFFF: Secrets page
+    //   0x09F000-0x09FFFF: CPUID page
+    //   0x100000-0x1nnnnn: kernel
+    //   0x1nnnnn-0x1nnnnn: filesystem
+    //   0x1nnnnn-0x1nnnnn: IGVM parameter block
+    //   0x1nnnnn-0x1nnnnn: general and memory map parameter pages
+    //   0xFFnn0000-0xFFFFFFFF: OVMF firmware (QEMU only, if specified)
+    construct_empty_pages(
+        args,
+        0x00000,
+        0xf000,
+        IgvmPageDataType::NORMAL,
+        &mut directives,
+        "Low memory",
+    );
+
+    // Construct a data object for the stage 2 image.  Stage 2 is always
+    // loaded at 64K.
+    let stage2_size = construct_data_pages_from_file(args, &args.stage2, 0x10000, &mut directives);
+    let mut address = 0x10000 + stage2_size;
+    match address.cmp(&0x9e000) {
+        cmp::Ordering::Greater => {
+            eprintln!("stage 2 image is too large");
+            exit(1);
+        }
+        cmp::Ordering::Less => {
+            construct_empty_pages(
+                args,
+                address,
+                0x9e000 - address,
+                IgvmPageDataType::NORMAL,
+                &mut directives,
+                "Stage 2 free space",
+            );
+        }
+        cmp::Ordering::Equal => {}
+    }
+
+    // Allocate a page to hold the secrets page.  This is not considered part
+    // of the IGVM data.
+    construct_empty_pages(
+        args,
+        0x9e000,
+        PAGE_SIZE_4K,
+        IgvmPageDataType::SECRETS,
+        &mut directives,
+        "Secrets page",
+    );
+
+    // Allocate the CPUID page
+    construct_empty_pages(
+        args,
+        0x9f000,
+        PAGE_SIZE_4K,
+        IgvmPageDataType::CPUID_DATA,
+        &mut directives,
+        "CPUID page",
+    );
+
+    // Plan to load the kernel image at a base address of 1 MB unless it must
+    // be relocated due to firmware.
+    address = 1 << 20;
+
+    // TODO: Read Hyper-V firmware
+
+    // Construct data for the kernel.
+    let kernel_address = address;
+    let kernel_size =
+        construct_data_pages_from_file(args, &args.kernel, kernel_address, &mut directives);
+    address += kernel_size;
+
+    // If a filesystem image is present, then load it after the kernel.  It is
+    // rounded up to the next page boundary to avoid overlapping with any of
+    // the pages in the kernel data object.
+    let filesystem_address = address;
+    let filesystem_size = if let Some(filesystem) = &args.filesystem {
+        construct_data_pages_from_file(args, filesystem, address, &mut directives)
+    } else {
+        0
+    };
+    address += filesystem_size;
+    let igvm_parameter_block_address = address;
+
+    // Construct the initial stack contents.
+    let stage2_stack = Stage2Stack {
+        kernel_start: kernel_address as u32,
+        kernel_end: (kernel_address + kernel_size) as u32,
+        filesystem_start: filesystem_address as u32,
+        filesystem_end: (filesystem_address + filesystem_size) as u32,
+        igvm_param_block: igvm_parameter_block_address as u32,
+        reserved: 0,
+    };
+    let mut stage2_stack_data = stage2_stack.as_bytes().to_vec();
+    let mut stage2_stack_page = vec![0u8; PAGE_SIZE_4K as usize - stage2_stack_data.len()];
+    stage2_stack_page.append(&mut stage2_stack_data);
+    construct_data_pages(
+        args,
+        0x00F000,
+        stage2_stack_page.as_bytes(),
+        &mut directives,
+        "Stage 2 stack",
+    );
+
+    match args.hypervisor {
+        Hypervisor::QEMU => {
+            // Place the kernel area at 512 GB with a size of 16 MB.
+            param_block.kernel_base = 0x0000008000000000;
+            param_block.kernel_size = 0x01000000;
+        }
+        Hypervisor::HyperV => {
+            // Place the kernel area at 64 MB with a size of 16 MB.
+            param_block.kernel_base = 0x04000000;
+            param_block.kernel_size = 0x01000000;
+
+            // TODO: Fix these lines
+            /*
+            if fw_info.fw_info.size != 0 {
+                // Mark the range between the top of the stage 2 area and the base
+                // of memory as a range that needs to be validated.
+                param_block.firmware.prevalidated_count = 1;
+                param_block.firmware.prevalidated[0].base = 0xA0000;
+                param_block.firmware.prevalidated[0].size = fw_info.fw_info.start - 0xA0000;
+
+                igvm_parameter_block->firmware = fw_info.fw_info;
+                igvm_parameter_block->vtom = fw_info.vtom;
+            } else {
+                // Set the shared GPA boundary at bit 46, below the lowest possible
+                // C-bit position.
+                param_block.vtom = 0x0000400000000000;
+            }
+
+            platform->SharedGpaBoundary = igvm_parameter_block->vtom;
+            */
+        }
+    }
+
+    construct_firmware_pages(args, &mut param_block, &mut directives)?;
+
+    // Place the VMSA at the base of the kernel region and mark that page
+    // as reserved.
+    let vmsa_address = param_block.kernel_base;
+    param_block.kernel_reserved_size = PAGE_SIZE_4K as u32;
+    construct_initial_vmsa(args, vmsa_address, &mut directives);
+
+    // The param block contents are complete now. Populate the data page.
+    let _ = construct_param_block(args, address, &param_block, &mut directives)?;
+
+    // General and memory map parameters
+    construct_parameter_page(
+        args,
+        address + param_block.param_page_offset as u64,
+        IGVM_GENERAL_PARAMS_PA,
+        &mut directives,
+        "General parameters",
+    );
+    construct_parameter_page(
+        args,
+        address + param_block.memory_map_offset as u64,
+        IGVM_MEMORY_MAP_PA,
+        &mut directives,
+        "Memory map",
+    );
+    print_param_block(args, &param_block);
 
     let file = IgvmFile::new(
         IgvmRevision::V1,
         vec![new_platform(0x1, IgvmPlatformType::SEV_SNP)],
         vec![],
-        directive,
+        directives,
     )
     .expect("Failed to create file");
     let mut binary_file = Vec::new();
     file.serialize(&mut binary_file).unwrap();
 
-    let mut file = File::create(out_filename).expect("Could not open file");
+    let mut file = File::create(&args.output).expect("Could not open file");
     file.write_all(binary_file.as_slice())
         .expect("Failed to write file");
+
+    Ok(())
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    /*
-    let args = vec![
-        "notused".to_string(),
-        "/home/rhopkins/src/coco-svsm-branches/rdh-svsm/svsm.bin".to_string(),
-        "svsm.igvm".to_string(),
-    ];
-    */
-    if args.len() != 3 {
-        println!("Usage igvm_svsm /path/to/svsm_base_dir /path/to/out.igvm");
-        return;
-    }
-    println!("Saving file as svsm.igvm");
-    create_svsm_igvm(&args[1], &args[2]);
+    let args = Args::parse();
+    let _ = create_igvm(&args);
 }
