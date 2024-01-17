@@ -23,8 +23,8 @@ pub struct IgvmParamPage {
 
 /// An entry that represents an area of pre-validated memory defined by the
 /// firmware in the IGVM file.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
 pub struct IgvmParamBlockFwMem {
     /// The base physical address of the prevalidated memory region.
     pub base: u32,
@@ -35,8 +35,8 @@ pub struct IgvmParamBlockFwMem {
 
 /// The portion of the IGVM parameter block that describes metadata about
 /// the firmware image embedded in the IGVM file.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug)]
 pub struct IgvmParamBlockFwInfo {
     /// The guest physical address of the start of the guest firmware. The
     /// permissions on the pages in the firmware range are adjusted to the guest
@@ -52,7 +52,7 @@ pub struct IgvmParamBlockFwInfo {
     /// memory and will not be loaded into the ROM range.
     pub in_low_memory: u8,
 
-    _reserved: [u8; 3],
+    pub _reserved: [u8; 7],
 
     /// The guest physical address at which the firmware expects to find the
     /// secrets page.
@@ -66,10 +66,6 @@ pub struct IgvmParamBlockFwInfo {
     /// CPUID page.
     pub cpuid_page: u32,
 
-    /// The guest physical address at which the firmware expects the reset
-    /// vector to be defined.
-    pub reset_addr: u32,
-
     /// The number of prevalidated memory regions defined by the firmware.
     pub prevalidated_count: u32,
 
@@ -80,8 +76,8 @@ pub struct IgvmParamBlockFwInfo {
 /// The IGVM parameter block is a measured page constructed by the IGVM file
 /// builder which describes where the additional IGVM parameter information
 /// has been placed into the guest address space.
-#[repr(C)]
-#[derive(Clone, Debug, Default)]
+#[repr(C, packed)]
+#[derive(Clone, Debug)]
 pub struct IgvmParamBlock {
     /// The total size of the parameter area, beginning with the parameter
     /// block itself and including any additional parameter pages which follow.

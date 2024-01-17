@@ -159,10 +159,11 @@ fn parse_sev_metadata(
 }
 
 fn parse_sev_info_block(
-    data: &[u8],
-    firmware: &mut IgvmParamBlockFwInfo,
+    _data: &[u8],
+    _firmware: &mut IgvmParamBlockFwInfo,
 ) -> Result<(), Box<dyn Error>> {
-    firmware.reset_addr = read_u32(&data[0..4])?;
+    // Not currently used
+    //firmware.reset_addr = read_u32(&data[0..4])?;
     Ok(())
 }
 
@@ -192,7 +193,6 @@ fn parse_table(data: &Vec<u8>, firmware: &mut IgvmParamBlockFwInfo) -> Result<()
     if ovmf_table.uuid != OVMF_TABLE_FOOTER_GUID.to_bytes_le() {
         return Err("OVMF table footer not found".into());
     }
-    println!("Found OVMF table footer.");
     current_offset = ovmf_table.data_offset + ovmf_table.data_length as usize;
 
     while current_offset > ovmf_table.data_offset {
