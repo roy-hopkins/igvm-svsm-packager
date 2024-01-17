@@ -13,12 +13,12 @@ use igvm_defs::{
 };
 use igvm_params::{IgvmParamBlock, IgvmParamBlockFwInfo};
 use ovmfmeta::parse_ovmf_metadata;
-use std::cmp;
 use std::error::Error;
 use std::fs::metadata;
 use std::io::Write;
 use std::mem::size_of;
 use std::process::exit;
+use std::{cmp, vec};
 use std::{fs::File, io::Read};
 use zerocopy::AsBytes;
 use zerocopy::FromZeroes;
@@ -93,6 +93,13 @@ struct Stage2Stack {
     pub reserved: u32,
 }
 
+struct DirectiveEntry {
+    gpa_start: u64,
+    gpa_end: u64,
+    directives: Vec<IgvmDirectiveHeader>,
+    description: String,
+}
+
 fn port_address(port: i32) -> u16 {
     match port {
         1 => 0x3f8,
@@ -145,7 +152,7 @@ fn default_param_block(args: &Args) -> IgvmParamBlock {
     }
 }
 
-fn construct_initial_vmsa(args: &Args, start_gpa: u64, directives: &mut Vec<IgvmDirectiveHeader>) {
+fn construct_initial_vmsa(gpa_start: u64) -> Result<DirectiveEntry, Box<dyn Error>> {
     let mut vmsa_box = SevVmsa::new_box_zeroed();
     let vmsa = vmsa_box.as_mut();
 
@@ -183,39 +190,31 @@ fn construct_initial_vmsa(args: &Args, start_gpa: u64, directives: &mut Vec<Igvm
     features.set_restrict_injection(true);
     vmsa.sev_features = features;
 
-    directives.push(IgvmDirectiveHeader::SnpVpContext {
-        gpa: start_gpa,
+    let directives = vec![IgvmDirectiveHeader::SnpVpContext {
+        gpa: gpa_start,
         compatibility_mask: COMPATIBILITY_MASK,
         vp_index: 0,
         vmsa: vmsa_box,
-    });
+    }];
 
-    if args.verbose {
-        println!(
-            "{:#010x}-{:#010x} VMSA",
-            start_gpa,
-            start_gpa + PAGE_SIZE_4K
-        );
-    }
+    Ok(DirectiveEntry {
+        gpa_start,
+        gpa_end: gpa_start + PAGE_SIZE_4K,
+        directives,
+        description: "VMSA".into(),
+    })
 }
 
+fn fill_cpuid_page() {}
+
 fn construct_empty_pages(
-    args: &Args,
-    start_gpa: u64,
+    gpa_start: u64,
     size: u64,
     data_type: IgvmPageDataType,
-    directives: &mut Vec<IgvmDirectiveHeader>,
     description: &str,
-) {
-    if args.verbose {
-        println!(
-            "{:#010x}-{:#010x} \"{}\" empty data",
-            start_gpa,
-            start_gpa + size,
-            description
-        );
-    }
-    for gpa in (start_gpa..(start_gpa + size)).step_by(PAGE_SIZE_4K as usize) {
+) -> Result<DirectiveEntry, Box<dyn Error>> {
+    let mut directives = Vec::<IgvmDirectiveHeader>::new();
+    for gpa in (gpa_start..(gpa_start + size)).step_by(PAGE_SIZE_4K as usize) {
         directives.push(IgvmDirectiveHeader::PageData {
             gpa,
             compatibility_mask: COMPATIBILITY_MASK,
@@ -224,45 +223,23 @@ fn construct_empty_pages(
             data: vec![],
         });
     }
-}
-
-fn construct_data_pages(
-    args: &Args,
-    start_gpa: u64,
-    data: &[u8],
-    directives: &mut Vec<IgvmDirectiveHeader>,
-    description: &str,
-) {
-    if args.verbose {
-        println!(
-            "{:#010x}-{:#010x} \"{}\" mem data",
-            start_gpa,
-            start_gpa + data.len() as u64,
-            description
-        );
-    }
-    for offset in (0..data.len()).step_by(PAGE_SIZE_4K as usize) {
-        let page = data[offset..(offset + PAGE_SIZE_4K as usize)].to_vec();
-        directives.push(IgvmDirectiveHeader::PageData {
-            gpa: start_gpa + offset as u64,
-            compatibility_mask: COMPATIBILITY_MASK,
-            flags: IgvmPageDataFlags::new(),
-            data_type: IgvmPageDataType::NORMAL,
-            data: page,
-        });
-    }
+    Ok(DirectiveEntry {
+        gpa_start,
+        gpa_end: gpa_start + size,
+        directives,
+        description: description.into(),
+    })
 }
 
 fn construct_data_pages_from_file(
-    args: &Args,
     path: &String,
-    gpa_base: u64,
-    directives: &mut Vec<IgvmDirectiveHeader>,
-) -> u64 {
-    let mut gpa = gpa_base;
+    gpa_start: u64,
+) -> Result<DirectiveEntry, Box<dyn Error>> {
+    let mut gpa = gpa_start;
     let mut in_file = File::open(path).expect("Could not open input file");
     let mut buf = vec![0; 4096];
 
+    let mut directives = Vec::<IgvmDirectiveHeader>::new();
     while let Ok(len) = in_file.read(&mut buf) {
         if len == 0 {
             break;
@@ -271,18 +248,19 @@ fn construct_data_pages_from_file(
         gpa += PAGE_SIZE_4K;
         buf = vec![0; 4096];
     }
-    if args.verbose {
-        println!("{:#010x}-{:#010x} \"{}\" file data", gpa_base, gpa, path);
-    }
-    gpa - gpa_base
+    Ok(DirectiveEntry {
+        gpa_start,
+        gpa_end: gpa,
+        directives,
+        description: path.to_string(),
+    })
 }
 
 fn construct_firmware_pages(
     args: &Args,
     param_block: &mut IgvmParamBlock,
-    directives: &mut Vec<IgvmDirectiveHeader>,
-) -> Result<(), Box<dyn Error>> {
-    if let Some(firmware) = &args.firmware {
+) -> Result<Option<DirectiveEntry>, Box<dyn Error>> {
+    let directive = if let Some(firmware) = &args.firmware {
         match args.hypervisor {
             Hypervisor::QEMU => {
                 parse_ovmf_metadata(firmware, &mut param_block.firmware)?;
@@ -293,26 +271,32 @@ fn construct_firmware_pages(
                 }
                 param_block.firmware.start = (0xffffffff - len + 1) as u32;
                 param_block.firmware.size = len as u32;
-                construct_data_pages_from_file(
-                    args,
+                Some(construct_data_pages_from_file(
                     firmware,
                     param_block.firmware.start as u64,
-                    directives,
-                );
+                )?)
             }
-            Hypervisor::HyperV => todo!(),
+            Hypervisor::HyperV => return Err("Hyper-V firmware not yet implemented".into()),
         }
-    }
-    Ok(())
+    } else {
+        None
+    };
+    Ok(directive)
 }
 
-fn construct_param_block(
-    args: &Args,
-    gpa: u64,
+fn construct_placeholder(gpa: u64, description: &str) -> Result<DirectiveEntry, Box<dyn Error>> {
+    Ok(DirectiveEntry {
+        gpa_start: gpa,
+        gpa_end: gpa + PAGE_SIZE_4K,
+        directives: vec![],
+        description: description.into(),
+    })
+}
+
+fn populate_param_block(
     param_block: &IgvmParamBlock,
-    directives: &mut Vec<IgvmDirectiveHeader>,
-) -> Result<u64, Box<dyn Error>> {
-    // The param block contents are complete now. Populate the data page.
+    entry: &mut DirectiveEntry,
+) -> Result<(), Box<dyn Error>> {
     let param_block_data = unsafe {
         let ptr = param_block as *const IgvmParamBlock as *const [u8; size_of::<IgvmParamBlock>()];
         &*ptr
@@ -322,23 +306,46 @@ fn construct_param_block(
     }
     let mut param_block_page = [0u8; PAGE_SIZE_4K as usize];
     param_block_page[..param_block_data.len()].clone_from_slice(param_block_data);
-    construct_data_pages(
-        args,
-        gpa,
-        &param_block_page,
-        directives,
-        "IGVM parameter block",
-    );
-    Ok(PAGE_SIZE_4K)
+
+    entry.directives.push(IgvmDirectiveHeader::PageData {
+        gpa: entry.gpa_start,
+        compatibility_mask: COMPATIBILITY_MASK,
+        flags: IgvmPageDataFlags::new(),
+        data_type: IgvmPageDataType::NORMAL,
+        data: param_block_page.to_vec(),
+    });
+
+    Ok(())
 }
 
-fn construct_parameter_page(
-    args: &Args,
+fn populate_stage2_stack(
+    stage2_stack: &Stage2Stack,
+    entry: &mut DirectiveEntry,
+) -> Result<(), Box<dyn Error>> {
+    let mut stage2_stack_data = stage2_stack.as_bytes().to_vec();
+    let mut stage2_stack_page = vec![0u8; PAGE_SIZE_4K as usize - stage2_stack_data.len()];
+    stage2_stack_page.append(&mut stage2_stack_data);
+
+    if stage2_stack_page.len() > PAGE_SIZE_4K as usize {
+        return Err("Stage 2 stack size exceeds 4K".into());
+    }
+
+    entry.directives.push(IgvmDirectiveHeader::PageData {
+        gpa: entry.gpa_start,
+        compatibility_mask: COMPATIBILITY_MASK,
+        flags: IgvmPageDataFlags::new(),
+        data_type: IgvmPageDataType::NORMAL,
+        data: stage2_stack_page,
+    });
+
+    Ok(())
+}
+
+fn construct_memory_map_parameter_page(
     gpa: u64,
     parameter_area_index: u32,
-    directive: &mut Vec<IgvmDirectiveHeader>,
     description: &str,
-) {
+) -> Result<DirectiveEntry, Box<dyn Error>> {
     let param_area = IgvmDirectiveHeader::ParameterArea {
         number_of_bytes: PAGE_SIZE_4K,
         parameter_area_index,
@@ -350,24 +357,72 @@ fn construct_parameter_page(
     });
     let param_insert = IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
         gpa,
-        compatibility_mask: 1,
+        compatibility_mask: COMPATIBILITY_MASK,
         parameter_area_index,
     });
 
-    // Order is important here. You need to declare the area, populate it
+    // Order of the directives is important here. You need to declare the area, populate it
     // then insert it.
-    directive.push(param_area);
-    directive.push(mm);
-    directive.push(param_insert);
+    Ok(DirectiveEntry {
+        gpa_start: gpa,
+        gpa_end: gpa + PAGE_SIZE_4K,
+        directives: vec![param_area, mm, param_insert],
+        description: description.into(),
+    })
+}
 
-    if args.verbose {
-        println!(
-            "{:#010x}-{:#010x} {} parameter",
-            gpa,
-            gpa + PAGE_SIZE_4K,
-            description
-        );
-    }
+fn construct_general_parameter_page(
+    gpa: u64,
+    parameter_area_index: u32,
+    description: &str,
+) -> Result<DirectiveEntry, Box<dyn Error>> {
+    let param_area = IgvmDirectiveHeader::ParameterArea {
+        number_of_bytes: 0x1000,
+        parameter_area_index: IGVM_GENERAL_PARAMS_PA,
+        initial_data: vec![],
+    };
+    let vp_count = IgvmDirectiveHeader::VpCount(IGVM_VHS_PARAMETER {
+        parameter_area_index: IGVM_GENERAL_PARAMS_PA,
+        byte_offset: 0,
+    });
+    let shared = IgvmDirectiveHeader::EnvironmentInfo(IGVM_VHS_PARAMETER {
+        parameter_area_index: IGVM_GENERAL_PARAMS_PA,
+        byte_offset: 4,
+    });
+    let param_insert = IgvmDirectiveHeader::ParameterInsert(IGVM_VHS_PARAMETER_INSERT {
+        gpa,
+        compatibility_mask: COMPATIBILITY_MASK,
+        parameter_area_index: IGVM_GENERAL_PARAMS_PA,
+    });
+
+    // Order of the directives is important here. You need to declare the area, populate it
+    // then insert it.
+    Ok(DirectiveEntry {
+        gpa_start: gpa,
+        gpa_end: gpa + PAGE_SIZE_4K,
+        directives: vec![param_area, vp_count, shared, param_insert],
+        description: description.into(),
+    })
+}
+
+fn construct_required_memory(
+    param_block: &IgvmParamBlock,
+) -> Result<DirectiveEntry, Box<dyn Error>> {
+    let required_memory = IgvmDirectiveHeader::RequiredMemory {
+        gpa: param_block.kernel_base,
+        compatibility_mask: COMPATIBILITY_MASK,
+        number_of_bytes: param_block.kernel_size,
+        vtl2_protectable: false,
+    };
+
+    // Order of the directives is important here. You need to declare the area, populate it
+    // then insert it.
+    Ok(DirectiveEntry {
+        gpa_start: param_block.kernel_base,
+        gpa_end: param_block.kernel_base + param_block.kernel_size as u64,
+        directives: vec![required_memory],
+        description: "Kernel memory".into(),
+    })
 }
 
 fn print_fw_metadata(args: &Args, param_block: &IgvmParamBlock) {
@@ -421,8 +476,10 @@ fn print_param_block(args: &Args, param_block: &IgvmParamBlock) {
     }
 }
 
-fn create_igvm(args: &Args) -> Result<(), Box<dyn Error>> {
-    let mut directives: Vec<IgvmDirectiveHeader> = vec![];
+fn build_directives(
+    args: &Args,
+    directives: &mut Vec<DirectiveEntry>,
+) -> Result<(), Box<dyn Error>> {
     let mut param_block = default_param_block(args);
 
     // This creates a file with the following guest memory layout:
@@ -437,18 +494,22 @@ fn create_igvm(args: &Args) -> Result<(), Box<dyn Error>> {
     //   0x1nnnnn-0x1nnnnn: IGVM parameter block
     //   0x1nnnnn-0x1nnnnn: general and memory map parameter pages
     //   0xFFnn0000-0xFFFFFFFF: OVMF firmware (QEMU only, if specified)
-    construct_empty_pages(
-        args,
+    directives.push(construct_empty_pages(
         0x00000,
         0xf000,
         IgvmPageDataType::NORMAL,
-        &mut directives,
         "Low memory",
-    );
+    )?);
+
+    // Create a placeholder for the Stage 2 stack page
+    directives.push(construct_placeholder(0x00F000, "Stage 2 stack")?);
+    let stage2_stack_index = directives.len() - 1;
 
     // Construct a data object for the stage 2 image.  Stage 2 is always
     // loaded at 64K.
-    let stage2_size = construct_data_pages_from_file(args, &args.stage2, 0x10000, &mut directives);
+    let stage2_entry = construct_data_pages_from_file(&args.stage2, 0x10000)?;
+    let stage2_size = stage2_entry.gpa_end - stage2_entry.gpa_start;
+    directives.push(stage2_entry);
     let mut address = 0x10000 + stage2_size;
     match address.cmp(&0x9e000) {
         cmp::Ordering::Greater => {
@@ -456,38 +517,32 @@ fn create_igvm(args: &Args) -> Result<(), Box<dyn Error>> {
             exit(1);
         }
         cmp::Ordering::Less => {
-            construct_empty_pages(
-                args,
+            directives.push(construct_empty_pages(
                 address,
                 0x9e000 - address,
                 IgvmPageDataType::NORMAL,
-                &mut directives,
                 "Stage 2 free space",
-            );
+            )?);
         }
         cmp::Ordering::Equal => {}
     }
 
     // Allocate a page to hold the secrets page.  This is not considered part
     // of the IGVM data.
-    construct_empty_pages(
-        args,
+    directives.push(construct_empty_pages(
         0x9e000,
         PAGE_SIZE_4K,
         IgvmPageDataType::SECRETS,
-        &mut directives,
         "Secrets page",
-    );
+    )?);
 
     // Allocate the CPUID page
-    construct_empty_pages(
-        args,
+    directives.push(construct_empty_pages(
         0x9f000,
         PAGE_SIZE_4K,
         IgvmPageDataType::CPUID_DATA,
-        &mut directives,
         "CPUID page",
-    );
+    )?);
 
     // Plan to load the kernel image at a base address of 1 MB unless it must
     // be relocated due to firmware.
@@ -497,41 +552,41 @@ fn create_igvm(args: &Args) -> Result<(), Box<dyn Error>> {
 
     // Construct data for the kernel.
     let kernel_address = address;
-    let kernel_size =
-        construct_data_pages_from_file(args, &args.kernel, kernel_address, &mut directives);
+    let kernel_entry = construct_data_pages_from_file(&args.kernel, kernel_address)?;
+    let kernel_size = kernel_entry.gpa_end - kernel_entry.gpa_start;
     address += kernel_size;
+    directives.push(kernel_entry);
 
     // If a filesystem image is present, then load it after the kernel.  It is
     // rounded up to the next page boundary to avoid overlapping with any of
     // the pages in the kernel data object.
     let filesystem_address = address;
     let filesystem_size = if let Some(filesystem) = &args.filesystem {
-        construct_data_pages_from_file(args, filesystem, address, &mut directives)
+        let fs_entry = construct_data_pages_from_file(filesystem, address)?;
+        let fs_size = fs_entry.gpa_end - fs_entry.gpa_start;
+        directives.push(fs_entry);
+        fs_size
     } else {
         0
     };
     address += filesystem_size;
     let igvm_parameter_block_address = address;
 
-    // Construct the initial stack contents.
-    let stage2_stack = Stage2Stack {
-        kernel_start: kernel_address as u32,
-        kernel_end: (kernel_address + kernel_size) as u32,
-        filesystem_start: filesystem_address as u32,
-        filesystem_end: (filesystem_address + filesystem_size) as u32,
-        igvm_param_block: igvm_parameter_block_address as u32,
-        reserved: 0,
-    };
-    let mut stage2_stack_data = stage2_stack.as_bytes().to_vec();
-    let mut stage2_stack_page = vec![0u8; PAGE_SIZE_4K as usize - stage2_stack_data.len()];
-    stage2_stack_page.append(&mut stage2_stack_data);
-    construct_data_pages(
-        args,
-        0x00F000,
-        stage2_stack_page.as_bytes(),
-        &mut directives,
-        "Stage 2 stack",
-    );
+    // Add a placeholder for the parameter block. We populate the contents later.
+    directives.push(construct_placeholder(address, "IGVM Parameter block")?);
+    let param_block_index = directives.len() - 1;
+
+    // General and memory map parameters
+    directives.push(construct_general_parameter_page(
+        address + param_block.param_page_offset as u64,
+        IGVM_GENERAL_PARAMS_PA,
+        "General parameters",
+    )?);
+    directives.push(construct_memory_map_parameter_page(
+        address + param_block.memory_map_offset as u64,
+        IGVM_MEMORY_MAP_PA,
+        "Memory map",
+    )?);
 
     match args.hypervisor {
         Hypervisor::QEMU => {
@@ -566,33 +621,56 @@ fn create_igvm(args: &Args) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    construct_firmware_pages(args, &mut param_block, &mut directives)?;
+    if let Some(fw_entry) = construct_firmware_pages(args, &mut param_block)? {
+        directives.push(fw_entry);
+    }
+
+    directives.push(construct_required_memory(&param_block)?);
 
     // Place the VMSA at the base of the kernel region and mark that page
     // as reserved.
     let vmsa_address = param_block.kernel_base;
     param_block.kernel_reserved_size = PAGE_SIZE_4K as u32;
-    construct_initial_vmsa(args, vmsa_address, &mut directives);
+    directives.push(construct_initial_vmsa(vmsa_address)?);
 
-    // The param block contents are complete now. Populate the data page.
-    let _ = construct_param_block(args, address, &param_block, &mut directives)?;
+    // Populate the param block and stack contents that we created placeholders for
+    populate_param_block(&param_block, directives.get_mut(param_block_index).unwrap())?;
 
-    // General and memory map parameters
-    construct_parameter_page(
-        args,
-        address + param_block.param_page_offset as u64,
-        IGVM_GENERAL_PARAMS_PA,
-        &mut directives,
-        "General parameters",
-    );
-    construct_parameter_page(
-        args,
-        address + param_block.memory_map_offset as u64,
-        IGVM_MEMORY_MAP_PA,
-        &mut directives,
-        "Memory map",
-    );
+    let stage2_stack = Stage2Stack {
+        kernel_start: kernel_address as u32,
+        kernel_end: (kernel_address + kernel_size) as u32,
+        filesystem_start: filesystem_address as u32,
+        filesystem_end: (filesystem_address + filesystem_size) as u32,
+        igvm_param_block: igvm_parameter_block_address as u32,
+        reserved: 0,
+    };
+    populate_stage2_stack(
+        &stage2_stack,
+        directives.get_mut(stage2_stack_index).unwrap(),
+    )?;
+
     print_param_block(args, &param_block);
+    Ok(())
+}
+
+fn create_igvm(args: &Args) -> Result<(), Box<dyn Error>> {
+    let mut entries: Vec<DirectiveEntry> = vec![];
+    let mut directives: Vec<IgvmDirectiveHeader> = vec![];
+    build_directives(args, &mut entries)?;
+
+    for mut entry in entries {
+        if args.verbose {
+            if entry.gpa_start != entry.gpa_end {
+                println!(
+                    "{:#010x}-{:#010x} {}",
+                    entry.gpa_start, entry.gpa_end, entry.description
+                );
+            } else {
+                println!("{}", entry.description);
+            }
+        }
+        directives.append(&mut entry.directives)
+    }
 
     let file = IgvmFile::new(
         IgvmRevision::V1,
